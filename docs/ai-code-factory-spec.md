@@ -2,7 +2,7 @@
 
 ## Summary
 
-Build a Linux-first autonomous coding factory around the latest Codex CLI. The system has a deterministic supervisor process that never stops, a persistent manager agent that communicates over Telegram and manages the backlog/release train, and isolated coding/review/testing workers that run in parallel in git worktrees with assigned ports.
+Build a Linux-first autonomous coding factory around the latest Codex CLI. The system has a deterministic supervisor process that never stops, a persistent manager agent that communicates over Telegram and manages the backlog/release train, and isolated coding/review/testing workers that run in parallel in git worktrees with per-worktree port leases when needed.
 
 The implementation target is:
 
@@ -11,7 +11,7 @@ The implementation target is:
 - Node.js + TypeScript control plane
 - SQLite for local state
 - Telegram for human interaction
-- `main` as last-stable branch, `candidate` as integration branch
+- the configured project default branch as last-stable branch, with `candidate` as integration branch
 
 The v1 design intentionally does **not** depend on the experimental Codex `multi_agent` feature. It uses stable documented CLI surfaces:
 
@@ -86,7 +86,7 @@ Responsibilities:
 
 The manager never directly shells out. It emits structured intents that `factoryd` validates and executes.
 
-The manager's behavior is versioned in [prompts/manager.md](/Users/sergey/code/permafactory/prompts/manager.md). `factoryd` must load that file as the manager thread's developer instructions when the thread is first created and on any cold resume after app-server restart.
+The manager's behavior is versioned in [prompts/manager.md](../prompts/manager.md). `factoryd` must load that file as the manager thread's developer instructions when the thread is first created and on any cold resume after app-server restart.
 
 ### 4. Worker agents
 
@@ -156,7 +156,7 @@ If the underlying Codex runtime exposes a lower maximum reasoning enum than `ext
 
 Use these long-lived branches:
 
-- `main`: last known stable, user-facing
+- `defaultBranch`: last known stable, user-facing
 - `candidate`: integration branch for accepted worker output
 
 Use these short-lived branches:
@@ -164,14 +164,14 @@ Use these short-lived branches:
 - `agent/<taskId>`: one per worker
 - `release/<timestamp>`: optional frozen candidate for promotion/debugging
 
-Worker branches are created from `candidate`. After review and checks pass, the manager requests a squash merge into `candidate`. Shipping fast-forwards `main` to the chosen `candidate` commit and tags it `stable-<timestamp>`.
+Worker branches are created from `candidate`. After review and checks pass, the manager requests a squash merge into `candidate`. Shipping fast-forwards `defaultBranch` to the chosen `candidate` commit and tags it `stable-<timestamp>`.
 
 Git authority is deterministic:
 
 - workers may modify files only inside their assigned worktree
 - only `factoryd` may create commits
 - only `factoryd` may create or remove branches
-- only `factoryd` may merge into `candidate` or move `main`
+- only `factoryd` may merge into `candidate` or move `defaultBranch`
 - only `factoryd` may tag releases or prune worktrees
 
 ## Process Model
@@ -232,7 +232,9 @@ Use SQLite with WAL mode. Tables:
 - `cleanup_runs`
 - `release_tags`
 
-SQLite is sufficient because only `factoryd` mutates state in v1.
+SQLite is sufficient because all state mutation stays on one host and mutation volume is low in v1.
+
+Steady-state mutation is owned by `factoryd`. Explicit admin/bootstrap commands in `factoryctl` may also mutate project state, but they must do so under the same per-project lock so `factoryd` and `factoryctl` never race on the same project.
 
 ## New Project Bootstrap
 
@@ -294,7 +296,8 @@ Example:
 factoryctl init \
   --repo /srv/projects/acme-web \
   --project-id acme-web \
-  --default-branch main
+  --default-branch main \
+  --project-spec-path docs/project-spec.md
 ```
 
 `factoryctl init` must:
@@ -306,10 +309,14 @@ factoryctl init \
 - create `.factory/runs/` and `.factory/scripts/`
 - create `candidate` from the default branch if it does not exist
 - generate `factory.config.ts` with discovered defaults and placeholders
+- detect a likely repo-local project spec path, or accept an explicit `--project-spec-path`
+- if no project spec exists, scaffold one at `docs/project-spec.md`
 - generate a `.env.factory.example`
 - generate or update a root `AGENTS.md` factory-policy stub if one does not already exist
 - scaffold `.factory/scripts/bootstrap-worktree.sh`
 - mark bootstrap status as `waiting_for_telegram`
+
+The configured project spec path is the canonical repo-local product/specification document for the manager. `factoryd` must persist that path in project config and include it in manager turns.
 
 #### `factoryctl telegram connect`
 
@@ -372,6 +379,18 @@ Each project moves through these states:
 - `paused`
 - `error`
 
+State meanings:
+
+- `waiting_for_config`: required bootstrap state is missing, for example the repo has not been initialized with `factoryctl init` yet, `factory.config.ts` does not exist, or required project metadata is incomplete
+- `waiting_for_telegram`: project config exists, but the Telegram control room has not been bound yet
+- `waiting_for_first_task`: Telegram is bound, but no task or inbox item has been ingested yet
+- `baselining_repo`: initial operability and preview-readiness work is in progress
+- `active`: bootstrap is complete and normal task scheduling may proceed
+- `paused`: scheduling is intentionally suspended
+- `error`: the project needs operator attention before normal automation can continue
+
+`factoryctl init` normally moves a project from `waiting_for_config` to `waiting_for_telegram`. If required configuration later goes missing or becomes invalid, `factoryd` may demote the project back to `waiting_for_config`.
+
 The project becomes `active` only after:
 
 - Telegram is bound
@@ -385,6 +404,7 @@ On the first run against a real project, the manager must not jump straight into
 
 Mandatory bootstrap work:
 
+- confirm or scaffold the canonical project spec path
 - detect and validate install/build/test/start scripts
 - run the project locally in the preview slot
 - establish a healthcheck path or command
@@ -467,7 +487,7 @@ Do not launch a new worker if any condition holds:
 - RAM > 80%
 - swap activity detected in the last minute
 - stable slot is unhealthy
-- fewer than 2 free worker ports remain
+- the next runnable task cannot obtain the app/e2e ports it requires
 
 If CPU > 85% or RAM > 90%:
 
@@ -640,6 +660,19 @@ Every decision card must include:
 - impact summary
 - budget cost, always `1` in v1
 
+### Unanswered decision behavior
+
+When a `decision_required` message has been sent and the user has not replied yet:
+
+- keep the decision open until the user replies or `expiresAt` passes
+- do not emit another equivalent decision while that decision is still open
+- do not block the whole factory; continue on assumptions or unrelated work
+- only tasks explicitly blocked by that decision remain blocked
+- if the user replies, resolve the decision immediately and wake the manager
+- if `expiresAt` passes with no reply, mark the decision `timed_out`, resolve it to `defaultOptionId` as the timeout default, and wake the manager immediately
+
+Managers must only emit decisions whose default option is safe to auto-apply on timeout. If no safe timeout default exists, the manager should avoid scheduling dependent work rather than relying on a risky decision card.
+
 ## Worktree and Port Strategy
 
 ### Worktree layout
@@ -652,7 +685,7 @@ Per worktree metadata:
 
 - branch name
 - base branch/commit
-- assigned ports
+- leased ports
 - owning agent id
 - current task id
 
@@ -670,7 +703,7 @@ Bootstrap responsibilities:
 
 - install dependencies from the lockfile
 - create or link safe local env files
-- write `.factory.env` with assigned ports and task metadata
+- write `.factory.env` with any assigned ports and task metadata
 - run any initial build/setup required for the repo to become runnable
 - seed local test data if the project requires it
 
@@ -699,17 +732,23 @@ Worker range:
 - app ports: `3200-3299`
 - auxiliary/e2e ports: `4200-4299`
 
+Worker worktrees lease ports by need:
+
+- review and read-only maintenance tasks may lease no worker ports
+- tasks that run a local app/server lease one app port
+- tasks that run browser automation or auxiliary services may also lease one auxiliary/e2e port
+
 Allocation policy:
 
-- lease the lowest free port pair
-- hold the lease until the worktree is archived
-- never share ports across active worktrees
+- lease the lowest free required port set for the task
+- bind the lease to the worktree
+- hold the lease until the worktree is archived or deleted
+- never share ports across active or retained worktrees
 
 Pass these env vars to worker commands:
 
-- `PORT`
-- `FACTORY_APP_PORT`
-- `FACTORY_E2E_PORT`
+- `PORT` and `FACTORY_APP_PORT` when an app port is leased
+- `FACTORY_E2E_PORT` when an auxiliary/e2e port is leased
 - `FACTORY_TASK_ID`
 - `FACTORY_BRANCH`
 
@@ -772,8 +811,9 @@ Keep AGENTS files concise and specific. They should hold persistent policy, not 
 export interface FactoryProjectConfig {
   projectId: string;
   repoRoot: string;
-  defaultBranch: "main";
+  defaultBranch: string;
   candidateBranch: "candidate";
+  projectSpecPath: string;
   timezone: string;
   codex: {
     versionFloor: string;
@@ -873,6 +913,7 @@ export interface ManagerTurnInput {
       | "active"
       | "paused"
       | "error";
+    projectSpecPath?: string;
     onboardingSummaryPath: string;
   };
   repo: {
@@ -892,6 +933,15 @@ export interface ManagerTurnInput {
     remainingNormal: number;
     remainingCriticalReserve: number;
   };
+  openDecisions: Array<{
+    id: string;
+    title: string;
+    priority: "critical" | "high" | "medium" | "low";
+    dedupeKey: string;
+    defaultOptionId: string;
+    expiresAt: string;
+    blockingTaskIds: string[];
+  }>;
   userMessages: Array<{
     id: string;
     source: "telegram";
@@ -1002,8 +1052,8 @@ export interface TaskContract {
   lockScope: string[];
   needsPreview: boolean;
   ports: {
-    app: number;
-    e2e: number;
+    app?: number;
+    e2e?: number;
   };
   runtime: {
     maxRuntimeMinutes: number;
@@ -1037,12 +1087,25 @@ export interface WorkerRun {
 }
 ```
 
-### Worker result
+### Worker results
 
-The final worker message must be JSON matching:
+Each worker role has its own final-result schema.
+
+- coding workers must match `schemas/worker-result.schema.json`
+- reviewer wrappers must match `schemas/reviewer-result.schema.json`
+- tester workers must match `schemas/tester-result.schema.json`
+
+All role-specific schemas must include these common fields:
+
+- `taskId`
+- `status`
+- `summary`
+- `followups`
+
+The coding worker schema is:
 
 ```ts
-export interface WorkerResult {
+export interface CodingWorkerResult {
   taskId: string;
   status: "completed" | "blocked" | "failed";
   summary: string;
@@ -1107,7 +1170,8 @@ codex app-server --listen ws://127.0.0.1:7781
 
 Then `factoryd` creates or resumes the manager thread and runs turns over WebSocket using:
 
-- developer instructions loaded from [prompts/manager.md](/Users/sergey/code/permafactory/prompts/manager.md)
+- developer instructions loaded from [prompts/manager.md](../prompts/manager.md)
+- project-specific context that includes the configured `projectSpecPath`
 - a single `ManagerTurnInput` JSON payload per turn
 - a strict `ManagerTurnOutput` JSON schema
 - model `gpt-5.4`
@@ -1129,10 +1193,15 @@ At minimum the run directory stores:
 
 `factoryd` must validate the final worker JSON against the role-specific schema before accepting the result as authoritative.
 
+For a coding task that leases both an app port and an auxiliary/e2e port:
+
 ```bash
 CODEX_HOME=/var/lib/factory/codex \
 PORT=<appPort> \
+FACTORY_APP_PORT=<appPort> \
 FACTORY_E2E_PORT=<e2ePort> \
+FACTORY_TASK_ID=<taskId> \
+FACTORY_BRANCH=<branchName> \
 codex exec --json \
   -C <worktreePath> \
   -m gpt-5.4 \
@@ -1143,6 +1212,8 @@ codex exec --json \
   --search \
   -
 ```
+
+If a task does not lease one of those ports, `factoryd` must omit the corresponding env var instead of fabricating a placeholder value.
 
 For coding workers, `mappedReasoningEffort` comes from `TaskContract.runtime.reasoningEffort` after applying the runtime fallback rule for `extra-high`.
 
@@ -1181,7 +1252,7 @@ Tester runs must follow the same run-directory and final-result validation patte
 4. run smoke checks against that inactive stable slot
 5. atomically switch the stable proxy to the newly built slot
 6. verify post-switch health on the new active stable slot
-7. fast-forward `main` to the now-live stable commit
+7. fast-forward `defaultBranch` to the now-live stable commit
 8. tag that commit `stable-<timestamp>`
 9. keep the previously active stable slot and artifact as the immediate rollback target
 10. send a mandatory `ship_result` Telegram message with stable URL, commit, and tag
@@ -1231,16 +1302,17 @@ For `completed` tasks:
 
 - archive task metadata and worker result immediately
 - kill any remaining child processes immediately
-- release port leases immediately
+- retain the port lease during the cooldown window
 - delete the worktree after a 30 minute cooldown
+- release port leases when the worktree is archived or deleted
 - delete the corresponding `agent/<taskId>` branch after the worktree is deleted and its diff is merged or intentionally discarded
 
 For `failed` or `blocked` tasks:
 
 - kill remaining child processes immediately
-- release port leases immediately
 - keep the worktree for inspection for 24 hours
-- then archive or delete it unless explicitly pinned for debugging
+- retain the port lease while the worktree is kept for inspection
+- then archive or delete it unless explicitly pinned for debugging, and release port leases as part of archival/deletion
 
 ### Artifact and log retention
 
@@ -1258,6 +1330,8 @@ Compress logs older than 24 hours before deletion.
 
 - expire unanswered decisions at `expiresAt`
 - mark expired decisions as `timed_out`
+- resolve expired decisions to `defaultOptionId` as the timeout default
+- enqueue a manager wakeup when a decision times out
 - resolved and expired decisions remain queryable for 90 days
 - completed inbox items remain queryable for 90 days
 - superseded inbox items may be auto-closed by the manager with a reason
@@ -1285,7 +1359,7 @@ Required behaviors:
 
 Cleanup is considered correct when:
 
-- no completed task holds ports after terminalization
+- no archived or deleted worktree retains ports
 - no orphan worker process survives a sweep
 - merged task worktrees do not accumulate indefinitely
 - rollback artifacts remain available after routine pruning
@@ -1339,10 +1413,12 @@ systemd/
 ### Unit tests
 
 - port allocator never reuses an active lease
+- port allocator can issue an app-only lease without reserving an auxiliary/e2e port
 - scope-lock allocator rejects overlapping coder tasks
 - decision budget resets by timezone and hard-stops at 15
 - decision budget preserves the critical reserve for high-priority questions
 - decision dedupe reuses equivalent open questions
+- unanswered decisions resolve to their default option on expiry and wake the manager
 - resource policy computes the expected worker cap
 - manager output schema rejects malformed deployment and decision payloads
 
@@ -1352,14 +1428,16 @@ systemd/
 - a stalled worker is interrupted, resumed once, then replaced on repeated failure
 - Telegram inbound message interrupts an active manager turn and receives a response within SLA
 - Telegram webhook rejects requests with a missing or invalid secret token
+- an unanswered open decision is surfaced in manager input and is not duplicated before expiry
 - two code workers can run simultaneously in separate worktrees with different ports
+- a read-only worker can run without reserving worker ports
 - two coders with overlapping lock scopes cannot run simultaneously
 - every worker terminal state enqueues a manager wakeup with the worker result
 - completed code changes trigger `codex review --base candidate`
 - successful stable promotion always emits a `ship_result` Telegram message
 - successful stable promotion switches traffic to the inactive blue/green slot only after smoke passes
-- completed tasks release their ports immediately and are cleaned up on schedule
-- blocked tasks retain inspectable worktrees until their TTL expires
+- completed tasks keep their leases until worktree archival, then are cleaned up on schedule
+- blocked tasks retain inspectable worktrees and their port leases until their TTL expires
 - preview can fail without taking down stable
 
 ### End-to-end tests
@@ -1392,7 +1470,7 @@ systemd/
 - SQLite is enough for v1 state
 - the recommended Telegram topology is a private supergroup, not a channel
 - production Telegram ingress uses webhooks with secret-token verification
-- `main` must remain stable
+- the configured default branch must remain stable
 - `candidate` may be unstable and is the source of preview deployments
 - the factory may continue working without immediate user response
 - all user choice prompts count against the 15/day budget
