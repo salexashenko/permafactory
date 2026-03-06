@@ -1,0 +1,7 @@
+[Unit]
+Description=AI Code Factory health probe
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/permafactory
+ExecStart=/usr/bin/env npm run factoryctl -- status --repo /opt/project --assert-healthy

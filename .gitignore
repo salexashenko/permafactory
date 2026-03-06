@@ -1,0 +1,10 @@
+node_modules/
+.factory/logs/
+.factory/runs/
+.factory/tasks/
+.factory/worktrees/
+.factory/*.sqlite
+.factory/*.sqlite-*
+.factory/*.pid
+.factory/.lock
+*.log

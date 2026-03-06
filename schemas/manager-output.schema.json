@@ -1,0 +1,364 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://permafactory.dev/schemas/manager-output.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "userMessages",
+    "tasksToStart",
+    "tasksToCancel",
+    "reviewsToStart",
+    "deployments",
+    "decisions",
+    "assumptions"
+  ],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "userMessages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "text"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "info_update",
+              "decision_required",
+              "incident_alert",
+              "ship_result",
+              "daily_digest"
+            ]
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1
+          },
+          "replyToMessageId": {
+            "type": "string"
+          },
+          "decisionId": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "tasksToStart": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/taskContract"
+      }
+    },
+    "tasksToCancel": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "reviewsToStart": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "taskId",
+          "branch",
+          "baseBranch",
+          "reason"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string"
+          },
+          "branch": {
+            "type": "string"
+          },
+          "baseBranch": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "deployments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "reason"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "deploy_preview",
+              "promote_candidate",
+              "rollback_stable"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          },
+          "commit": {
+            "type": "string"
+          },
+          "rollbackTag": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/decisionRequest"
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "$defs": {
+    "decisionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "reason",
+        "priority",
+        "dedupeKey",
+        "options",
+        "defaultOptionId",
+        "expiresAt",
+        "impactSummary",
+        "budgetCost"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "priority": {
+          "enum": [
+            "critical",
+            "high",
+            "medium",
+            "low"
+          ]
+        },
+        "dedupeKey": {
+          "type": "string"
+        },
+        "options": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 4,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "label",
+              "consequence"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "consequence": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "defaultOptionId": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "impactSummary": {
+          "type": "string"
+        },
+        "budgetCost": {
+          "const": 1
+        }
+      }
+    },
+    "taskContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "title",
+        "goal",
+        "acceptanceCriteria",
+        "baseBranch",
+        "branchName",
+        "worktreePath",
+        "lockScope",
+        "needsPreview",
+        "ports",
+        "runtime",
+        "constraints",
+        "context"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "code",
+            "review-fix",
+            "test",
+            "maintenance"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "goal": {
+          "type": "string"
+        },
+        "acceptanceCriteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "baseBranch": {
+          "type": "string"
+        },
+        "branchName": {
+          "type": "string"
+        },
+        "worktreePath": {
+          "type": "string"
+        },
+        "lockScope": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "needsPreview": {
+          "type": "boolean"
+        },
+        "ports": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "app": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "e2e": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "maxRuntimeMinutes",
+            "reasoningEffort"
+          ],
+          "properties": {
+            "maxRuntimeMinutes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "reasoningEffort": {
+              "enum": [
+                "medium",
+                "extra-high"
+              ]
+            }
+          }
+        },
+        "constraints": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mustRunChecks"
+          ],
+          "properties": {
+            "files": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "doNotTouch": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "mustRunChecks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "context": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "userIntent",
+            "relatedTaskIds",
+            "blockingDecisions"
+          ],
+          "properties": {
+            "userIntent": {
+              "type": "string"
+            },
+            "relatedTaskIds": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "blockingDecisions": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

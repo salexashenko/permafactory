@@ -1,0 +1,1766 @@
+import http from "node:http";
+import net from "node:net";
+import path from "node:path";
+import { spawn, type ChildProcess } from "node:child_process";
+import { open } from "node:fs/promises";
+import process from "node:process";
+import type { Duplex } from "node:stream";
+import { parseArgs } from "node:util";
+import { FactoryDatabase } from "@permafactory/db";
+import { loadProjectConfig } from "@permafactory/config";
+import { DEFAULT_MANAGER_THREAD_NAME } from "@permafactory/models";
+import type {
+  CodingWorkerResult,
+  FactoryProjectConfig,
+  ManagerTurnInput,
+  ManagerTurnOutput,
+  ReviewerResult,
+  TaskContract,
+  TesterResult
+} from "@permafactory/models";
+import {
+  addWorktree,
+  allocatePorts,
+  currentCommit,
+  derivePortLeaseRequirement,
+  ensureDetachedWorktreeAtRef,
+  ensureDir,
+  getFactoryPaths,
+  isPlaceholderScript,
+  listDirtyFiles,
+  localDateString,
+  nowIso,
+  randomId,
+  readText,
+  runCommand,
+  sampleResources,
+  sendTelegramApiRequest,
+  slugify,
+  spawnLoggedShellCommand,
+  spawnLoggedProcess,
+  validateWithSchema,
+  waitForSuccessfulCommand,
+  writeText
+} from "@permafactory/runtime";
+
+type JsonRpcResponse = {
+  id?: number;
+  result?: unknown;
+  error?: { code: number; message: string };
+  method?: string;
+  params?: unknown;
+};
+
+type RuntimeSlotName = "stable-a" | "stable-b" | "preview";
+
+interface ManagedRuntimeProcess {
+  child: ChildProcess;
+  commit: string;
+  worktreePath: string;
+  port: number;
+  script: string;
+}
+
+class InterruptedTurnError extends Error {
+  constructor(public readonly threadId: string, public readonly turnId: string) {
+    super(`Turn ${turnId} on thread ${threadId} was interrupted`);
+  }
+}
+
+void main().catch((error) => {
+  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  process.exitCode = 1;
+});
+
+async function main(): Promise<void> {
+  const parsed = parseArgs({
+    args: process.argv.slice(2),
+    options: {
+      repo: { type: "string" },
+      once: { type: "boolean" }
+    },
+    strict: true
+  });
+
+  const repoRoot = path.resolve(parsed.values.repo ?? process.cwd());
+  const config = await loadProjectConfig(repoRoot);
+  const db = await FactoryDatabase.open(repoRoot);
+  db.init();
+  db.upsertProject(config);
+  const supervisor = new FactorySupervisor(config, db);
+  await supervisor.run(Boolean(parsed.values.once));
+}
+
+class AppServerClient {
+  private socket?: WebSocket;
+  private requestId = 1;
+  private initialized = false;
+  private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
+  private notificationListeners = new Set<(message: JsonRpcResponse) => void>();
+
+  constructor(private readonly url: string) {}
+
+  async connect(): Promise<void> {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      return;
+    }
+
+    const SocketImpl = (globalThis as typeof globalThis & { WebSocket: typeof WebSocket }).WebSocket;
+    this.socket = new SocketImpl(this.url);
+
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`Timed out connecting to ${this.url}`)), 5000);
+      this.socket?.addEventListener("open", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      this.socket?.addEventListener("error", () => {
+        clearTimeout(timer);
+        reject(new Error(`Failed connecting to ${this.url}`));
+      });
+    });
+
+    this.socket.addEventListener("message", (event) => {
+      const text = typeof event.data === "string" ? event.data : String(event.data);
+      const message = JSON.parse(text) as JsonRpcResponse;
+      if (typeof message.id === "number") {
+        const pending = this.pending.get(message.id);
+        if (!pending) {
+          return;
+        }
+        this.pending.delete(message.id);
+        if (message.error) {
+          pending.reject(new Error(message.error.message));
+        } else {
+          pending.resolve(message.result);
+        }
+        return;
+      }
+
+      for (const listener of this.notificationListeners) {
+        listener(message);
+      }
+    });
+
+    this.socket.addEventListener("close", () => {
+      for (const [id, pending] of this.pending.entries()) {
+        this.pending.delete(id);
+        pending.reject(new Error("App server socket closed"));
+      }
+    });
+  }
+
+  async initialize(): Promise<void> {
+    if (this.initialized) {
+      return;
+    }
+
+    await this.connect();
+    await this.sendRequest("initialize", {
+      clientInfo: { name: "permafactory", version: "0.1.0" },
+      capabilities: null
+    });
+    this.initialized = true;
+  }
+
+  onNotification(listener: (message: JsonRpcResponse) => void): () => void {
+    this.notificationListeners.add(listener);
+    return () => this.notificationListeners.delete(listener);
+  }
+
+  async request<T>(method: string, params: unknown): Promise<T> {
+    await this.initialize();
+    return await this.sendRequest<T>(method, params);
+  }
+
+  private async sendRequest<T>(method: string, params: unknown): Promise<T> {
+    await this.connect();
+    const id = this.requestId++;
+    const payload = { jsonrpc: "2.0", id, method, params };
+
+    const promise = new Promise<T>((resolve, reject) => {
+      this.pending.set(id, {
+        resolve: (value) => resolve(value as T),
+        reject
+      });
+    });
+
+    this.socket?.send(JSON.stringify(payload));
+    return await promise;
+  }
+
+  async ensureManagerThread(
+    threadId: string | undefined,
+    config: FactoryProjectConfig,
+    developerInstructions: string
+  ): Promise<string> {
+    const params = {
+      model: config.codex.managerModel,
+      cwd: config.repoRoot,
+      approvalPolicy: "never",
+      sandbox: config.codex.sandboxMode,
+      serviceName: "permafactory",
+      developerInstructions,
+      personality: null,
+      experimentalRawEvents: false
+    };
+
+    try {
+      if (threadId) {
+        const resumed = await this.request<{ thread: { id: string } }>("thread/resume", {
+          threadId,
+          ...params
+        });
+        return resumed.thread.id;
+      }
+    } catch {
+      // Start fresh below.
+    }
+
+    const started = await this.request<{ thread: { id: string } }>("thread/start", params);
+    return started.thread.id;
+  }
+
+  async interruptTurn(threadId: string, turnId: string): Promise<void> {
+    await this.request("turn/interrupt", { threadId, turnId });
+  }
+
+  async startTurn(
+    threadId: string,
+    inputText: string,
+    outputSchema: unknown | undefined,
+    timeoutMs = 10 * 60 * 1000
+  ): Promise<{ turnId: string; completion: Promise<{ status: string; outputText?: string }> }> {
+    const result = await this.request<{ turn: { id: string } }>("turn/start", {
+      threadId,
+      input: [{ type: "text", text: inputText, text_elements: [] }],
+      ...(outputSchema ? { outputSchema } : {})
+    });
+    const turnId = result.turn.id;
+    return {
+      turnId,
+      completion: this.collectTurnResult(threadId, turnId, timeoutMs)
+    };
+  }
+
+  private async collectTurnResult(
+    threadId: string,
+    turnId: string,
+    timeoutMs: number
+  ): Promise<{ status: string; outputText?: string }> {
+    const status = await this.waitForTurn(threadId, turnId, timeoutMs);
+    if (status !== "completed") {
+      if (/(interrupt|cancel)/i.test(status)) {
+        throw new InterruptedTurnError(threadId, turnId);
+      }
+      throw new Error(`Turn ${turnId} finished with status ${status}`);
+    }
+
+    const thread = await this.request<{ thread: { turns: Array<{ id: string; items: Array<{ type: string; text?: string }> }> } }>(
+      "thread/read",
+      { threadId, includeTurns: true }
+    );
+
+    const turn = thread.thread.turns.find((candidate) => candidate.id === turnId);
+    const lastAgentMessage = [...(turn?.items ?? [])]
+      .reverse()
+      .find((item) => item.type === "agentMessage" && typeof item.text === "string");
+    if (!lastAgentMessage?.text) {
+      throw new Error(`No final agent message found for turn ${turnId}`);
+    }
+
+    return { status, outputText: lastAgentMessage.text };
+  }
+
+  private async waitForTurn(threadId: string, turnId: string, timeoutMs: number): Promise<string> {
+    return await new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        unsubscribe();
+        reject(new Error(`Timed out waiting for turn ${turnId}`));
+      }, timeoutMs);
+
+      const unsubscribe = this.onNotification((message) => {
+        if (
+          message.method === "turn/completed" &&
+          message.params &&
+          typeof message.params === "object" &&
+          "threadId" in message.params &&
+          "turn" in message.params
+        ) {
+          const params = message.params as { threadId: string; turn: { id: string; status: string } };
+          if (params.threadId === threadId && params.turn.id === turnId) {
+            clearTimeout(timer);
+            unsubscribe();
+            resolve(params.turn.status);
+          }
+        }
+      });
+    });
+  }
+}
+
+class FactorySupervisor {
+  private readonly paths: ReturnType<typeof getFactoryPaths>;
+  private readonly managerSchemaPath: string;
+  private readonly workerSchemaPath: string;
+  private readonly reviewerSchemaPath: string;
+  private readonly testerSchemaPath: string;
+  private readonly managerPromptPath: string;
+  private readonly workerPromptPath: string;
+  private readonly reviewerPromptPath: string;
+  private readonly testerPromptPath: string;
+  private managerRunning = false;
+  private appServerProcess?: ChildProcess;
+  private appServerClient?: AppServerClient;
+  private dashboardServer?: http.Server;
+  private stableProxyServer?: http.Server;
+  private workerChildren = new Map<string, ChildProcess>();
+  private runtimeProcesses = new Map<RuntimeSlotName, ManagedRuntimeProcess>();
+  private pendingManagerWakeReasons = new Set<string>(["startup"]);
+  private activeManagerTurnId?: string;
+  private activeManagerThreadId?: string;
+
+  constructor(private config: FactoryProjectConfig, private readonly db: FactoryDatabase) {
+    this.paths = getFactoryPaths(this.config.repoRoot);
+    this.managerSchemaPath = path.resolve(this.config.repoRoot, "schemas/manager-output.schema.json");
+    this.workerSchemaPath = path.resolve(this.config.repoRoot, "schemas/worker-result.schema.json");
+    this.reviewerSchemaPath = path.resolve(this.config.repoRoot, "schemas/reviewer-result.schema.json");
+    this.testerSchemaPath = path.resolve(this.config.repoRoot, "schemas/tester-result.schema.json");
+    this.managerPromptPath = path.resolve(this.config.repoRoot, "prompts/manager.md");
+    this.workerPromptPath = path.resolve(this.config.repoRoot, "prompts/worker.md");
+    this.reviewerPromptPath = path.resolve(this.config.repoRoot, "prompts/reviewer.md");
+    this.testerPromptPath = path.resolve(this.config.repoRoot, "prompts/tester.md");
+  }
+
+  async run(once: boolean): Promise<void> {
+    await ensureDir(this.paths.logsDir);
+    await ensureDir(this.paths.tasksDir);
+    await ensureDir(this.paths.worktreesDir);
+    await ensureDir(this.paths.runtimeDir);
+    await ensureDir(this.paths.runsDir);
+    await this.refreshProjectState();
+    if (!once) {
+      await this.startDashboardServer();
+    }
+
+    do {
+      await this.tick();
+      if (!once) {
+        await new Promise((resolve) => setTimeout(resolve, this.config.scheduler.tickSeconds * 1000));
+      }
+    } while (!once);
+  }
+
+  private async tick(): Promise<void> {
+    this.config = await loadProjectConfig(this.config.repoRoot);
+    this.db.upsertProject(this.config);
+    await this.refreshProjectState();
+    await this.reconcileRuntimeTargets();
+
+    const expiredDecisions = this.db.expireTimedOutDecisions();
+    if (expiredDecisions.length > 0) {
+      const requeuedTasks = this.db.requeueSatisfiedBlockedTasks(this.config.projectId);
+      for (const taskId of requeuedTasks) {
+        this.db.insertTaskEvent(taskId, "queued", "Task re-queued after decision timeout");
+      }
+      this.pendingManagerWakeReasons.add("decision_timeout");
+    }
+
+    const agents = this.db.listAgents(this.config.projectId);
+    const activeWorkers = agents.filter(
+      (agent) => agent.role !== "manager" && agent.status === "running"
+    ).length;
+    const resources = await sampleResources(this.config.scheduler.maxWorkers, activeWorkers);
+    this.db.recordHealthSample(this.config.projectId, resources);
+    await this.maybeSendDailyDigest(resources);
+
+    if (this.shouldRunManager(resources)) {
+      await this.runManagerTurn(resources);
+    }
+
+    await this.startQueuedTasksIfPossible();
+  }
+
+  private shouldRunManager(resources: ManagerTurnInput["resources"]): boolean {
+    if (this.managerRunning) {
+      return false;
+    }
+
+    if (this.pendingManagerWakeReasons.size > 0) {
+      return true;
+    }
+
+    const inboxItems = this.db.listInboxItems(this.config.projectId);
+    if (inboxItems.some((item) => item.status === "new")) {
+      return true;
+    }
+
+    return false;
+  }
+
+  private async runManagerTurn(resources: ManagerTurnInput["resources"]): Promise<void> {
+    this.managerRunning = true;
+    const wakeReasons = [...this.pendingManagerWakeReasons];
+    this.pendingManagerWakeReasons.clear();
+
+    try {
+      await this.ensureAppServer();
+      const client = this.getAppServerClient();
+      const developerInstructions = await this.buildManagerInstructions();
+      const threadId = await client.ensureManagerThread(
+        this.activeManagerThreadId ?? this.db.getAgentSession("manager", "thread")?.sessionId,
+        this.config,
+        developerInstructions
+      );
+      this.activeManagerThreadId = threadId;
+      this.db.upsertAgent({
+        id: "manager",
+        projectId: this.config.projectId,
+        role: "manager",
+        status: "running",
+        threadId
+      });
+      this.db.setAgentSession({
+        id: "manager-thread",
+        projectId: this.config.projectId,
+        agentId: "manager",
+        sessionType: "thread",
+        sessionId: threadId,
+        transport: "app-server"
+      });
+
+      const input = await this.buildManagerInput(resources);
+      const startedTurn = await client.startTurn(
+        threadId,
+        JSON.stringify(input, null, 2),
+        undefined
+      );
+      this.activeManagerTurnId = startedTurn.turnId;
+      this.db.upsertAgent({
+        id: "manager",
+        projectId: this.config.projectId,
+        role: "manager",
+        status: "running",
+        threadId,
+        turnId: startedTurn.turnId
+      });
+
+      const result = await startedTurn.completion;
+      if (!result.outputText) {
+        throw new Error(`Manager turn ${startedTurn.turnId} produced no output text`);
+      }
+
+      const parsed = JSON.parse(result.outputText) as unknown;
+      const validated = await validateWithSchema<ManagerTurnOutput>(this.managerSchemaPath, parsed);
+      if (!validated.valid) {
+        throw new Error(`Manager output validation failed: ${validated.errors.join("; ")}`);
+      }
+
+      await this.applyManagerOutput(validated.value, wakeReasons);
+      for (const inboxItem of this.db.listInboxItems(this.config.projectId, ["new"])) {
+        this.db.markInboxItemStatus(inboxItem.id, "triaged");
+      }
+
+      this.db.upsertAgent({
+        id: "manager",
+        projectId: this.config.projectId,
+        role: "manager",
+        status: "idle",
+        threadId,
+        turnId: undefined
+      });
+    } catch (error) {
+      if (error instanceof InterruptedTurnError) {
+        this.db.upsertAgent({
+          id: "manager",
+          projectId: this.config.projectId,
+          role: "manager",
+          status: "idle",
+          threadId: this.activeManagerThreadId
+        });
+        this.pendingManagerWakeReasons.add("manager_interrupted");
+        return;
+      }
+
+      this.db.upsertAgent({
+        id: "manager",
+        projectId: this.config.projectId,
+        role: "manager",
+        status: "failed",
+        threadId: this.activeManagerThreadId
+      });
+      console.error(`manager turn failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.pendingManagerWakeReasons.add("manager_failure");
+    } finally {
+      this.activeManagerTurnId = undefined;
+      this.managerRunning = false;
+    }
+  }
+
+  private async buildManagerInstructions(): Promise<string> {
+    const prompt = await readText(this.managerPromptPath);
+    return `${prompt}\n\n## Project Context\n\n- repoRoot: ${this.config.repoRoot}\n- defaultBranch: ${this.config.defaultBranch}\n- candidateBranch: ${this.config.candidateBranch}\n- projectSpecPath: ${this.config.projectSpecPath}\n- managerThreadName: ${DEFAULT_MANAGER_THREAD_NAME}\n`;
+  }
+
+  private async buildManagerInput(resources: ManagerTurnInput["resources"]): Promise<ManagerTurnInput> {
+    const input = this.db.getManagerInput(this.config);
+    input.repo.dirtyFiles = await listDirtyFiles(this.config.repoRoot);
+    input.repo.currentStableCommit = await currentCommit(this.config.repoRoot, this.config.defaultBranch);
+    input.repo.currentCandidateCommit = await currentCommit(
+      this.config.repoRoot,
+      this.config.candidateBranch
+    );
+    input.resources = resources;
+    input.deployments = this.db.getDeploymentSnapshot(this.config.projectId);
+    return input;
+  }
+
+  private async applyManagerOutput(
+    output: ManagerTurnOutput,
+    wakeReasons: string[]
+  ): Promise<void> {
+    console.log(`[manager] ${output.summary}`);
+    if (wakeReasons.length > 0) {
+      console.log(`[manager] wake reasons: ${wakeReasons.join(", ")}`);
+    }
+
+    for (const decision of output.decisions) {
+      await this.maybeCreateDecision(decision);
+    }
+
+    for (const message of output.userMessages) {
+      await this.sendTelegramMessage(message.kind, message.text, message.replyToMessageId, message.decisionId);
+    }
+
+    for (const taskId of output.tasksToCancel) {
+      await this.cancelTask(taskId);
+    }
+
+    for (const contract of output.tasksToStart) {
+      await this.materializeAndStartTask(contract);
+    }
+
+    for (const review of output.reviewsToStart) {
+      const task = this.db.getTask(review.taskId);
+      if (!task?.contract) {
+        continue;
+      }
+      const reviewTask: TaskContract = {
+        ...task.contract,
+        id: randomId("review"),
+        kind: "test",
+        title: `Review ${task.title}`,
+        goal: review.reason,
+        runtime: { maxRuntimeMinutes: 30, reasoningEffort: "medium" },
+        constraints: {
+          ...task.contract.constraints,
+          mustRunChecks: []
+        }
+      };
+      await this.startWorker(reviewTask, "review");
+    }
+
+    for (const deployment of output.deployments) {
+      try {
+        await this.handleDeploymentIntent(deployment);
+      } catch (error) {
+        await this.sendTelegramMessage(
+          "incident_alert",
+          `Deployment ${deployment.kind} failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+  }
+
+  private async maybeCreateDecision(decision: ManagerTurnOutput["decisions"][number]): Promise<void> {
+    const budget = this.db.getDecisionBudget(
+      this.config.projectId,
+      this.config.timezone,
+      this.config.decisionBudget.dailyLimit,
+      this.config.decisionBudget.reserveCritical
+    );
+    if (this.db.findOpenDecisionByDedupe(this.config.projectId, decision.dedupeKey)) {
+      return;
+    }
+
+    if (budget.remaining <= 0) {
+      return;
+    }
+
+    if (decision.priority !== "critical" && budget.remainingNormal <= 0) {
+      return;
+    }
+
+    this.db.insertDecision(this.config.projectId, decision);
+    this.db.incrementDecisionBudget(this.config.projectId, this.config.timezone);
+
+    const keyboard = decision.options.map((option) => [
+      {
+        text: option.label,
+        callback_data: `decision:${decision.id}:${option.id}`
+      }
+    ]);
+
+    await this.sendTelegramMessage(
+      "decision_required",
+      `${decision.title}\n\n${decision.reason}\n\nDefault: ${decision.defaultOptionId}\nExpires: ${decision.expiresAt}`,
+      undefined,
+      decision.id,
+      keyboard
+    );
+  }
+
+  private async sendTelegramMessage(
+    kind: string,
+    text: string,
+    replyToMessageId?: string,
+    decisionId?: string,
+    inlineKeyboard?: Array<Array<{ text: string; callback_data: string }>>
+  ): Promise<void> {
+    const messageId = randomId("telegram");
+    const chatId = this.config.telegram.controlChatId;
+    const botToken = process.env[this.config.telegram.botTokenEnvVar];
+
+    this.db.insertTelegramMessage({
+      id: messageId,
+      projectId: this.config.projectId,
+      chatId,
+      direction: "outbound",
+      kind,
+      text,
+      replyToMessageId,
+      decisionId
+    });
+
+    if (!chatId || !botToken) {
+      console.log(`[telegram:${kind}] ${text}`);
+      return;
+    }
+
+    try {
+      await sendTelegramApiRequest(botToken, "sendMessage", {
+        chat_id: chatId,
+        text,
+        reply_to_message_id: replyToMessageId ? Number.parseInt(replyToMessageId, 10) : undefined,
+        reply_markup: inlineKeyboard ? { inline_keyboard: inlineKeyboard } : undefined
+      });
+    } catch (error) {
+      console.error(`telegram send failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private async cancelTask(taskId: string): Promise<void> {
+    const task = this.db.getTask(taskId);
+    if (!task) {
+      return;
+    }
+
+    const agent = this.db.listAgents(this.config.projectId).find((candidate) => candidate.taskId === taskId);
+    if (agent?.pid) {
+      try {
+        process.kill(agent.pid, "SIGINT");
+      } catch {
+        // Ignore already-dead children.
+      }
+    }
+
+    this.db.updateTaskStatus(taskId, "cancelled");
+    this.db.insertTaskEvent(taskId, "cancelled", "Task cancelled by manager");
+  }
+
+  private async materializeAndStartTask(contract: TaskContract): Promise<void> {
+    const branchName = contract.branchName || `agent/${slugify(contract.id)}`;
+    const worktreePath = contract.worktreePath || path.join(this.paths.worktreesDir, contract.id);
+    const normalized: TaskContract = {
+      ...contract,
+      branchName,
+      worktreePath,
+      baseBranch: contract.baseBranch || this.config.candidateBranch,
+      ports: contract.ports ?? {}
+    };
+    const openDecisionIds = new Set(
+      this.db.listOpenDecisions(this.config.projectId).map((decision) => decision.id)
+    );
+    const unresolvedBlockingDecisions = normalized.context.blockingDecisions.filter((decisionId) =>
+      openDecisionIds.has(decisionId)
+    );
+    const initialStatus = unresolvedBlockingDecisions.length > 0 ? "blocked" : "queued";
+
+    this.db.upsertTask({
+      projectId: this.config.projectId,
+      id: normalized.id,
+      kind: normalized.kind,
+      status: initialStatus,
+      title: normalized.title,
+      priority: "medium",
+      goal: normalized.goal,
+      branchName: normalized.branchName,
+      baseBranch: normalized.baseBranch,
+      worktreePath: normalized.worktreePath,
+      contract: normalized,
+      blockedByDecisionIds: unresolvedBlockingDecisions
+    });
+
+    if (unresolvedBlockingDecisions.length > 0) {
+      this.db.insertTaskEvent(
+        normalized.id,
+        "blocked",
+        `Task blocked pending decision(s): ${unresolvedBlockingDecisions.join(", ")}`
+      );
+      return;
+    }
+  }
+
+  private async startQueuedTasksIfPossible(): Promise<void> {
+    const runningWorkers = this.db
+      .listAgents(this.config.projectId)
+      .filter((agent) => agent.role !== "manager" && agent.status === "running").length;
+    const availableSlots = Math.max(0, this.config.scheduler.maxWorkers - runningWorkers);
+    if (availableSlots <= 0) {
+      return;
+    }
+
+    const queuedTasks = this.db
+      .listTasks(this.config.projectId)
+      .filter((task) => task.status === "queued" && task.contract)
+      .slice(0, availableSlots);
+    for (const task of queuedTasks) {
+      try {
+        await this.startWorker(task.contract as TaskContract, task.kind === "test" ? "test" : "code");
+      } catch (error) {
+        this.db.updateTaskStatus(task.id, "failed");
+        this.db.insertTaskEvent(
+          task.id,
+          "failed",
+          `Task failed to start: ${error instanceof Error ? error.message : String(error)}`
+        );
+        console.error(`task ${task.id} failed to start: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+
+  private async startWorker(
+    contract: TaskContract,
+    role: "code" | "review" | "test"
+  ): Promise<void> {
+    const worktreeId = contract.id;
+    const worktreePath = contract.worktreePath;
+    const branchName = contract.branchName;
+    const baseBranch = contract.baseBranch || this.config.candidateBranch;
+    const requirement = derivePortLeaseRequirement(contract);
+    const usedPorts = new Set(this.db.listActivePortLeases(this.config.projectId).map((lease) => lease.port));
+    const allocatedPorts = allocatePorts(this.config, usedPorts, {
+      app: requirement.app && contract.ports.app === undefined,
+      e2e: requirement.e2e && contract.ports.e2e === undefined
+    });
+    const normalized: TaskContract = {
+      ...contract,
+      ports: {
+        ...(contract.ports.app !== undefined ? { app: contract.ports.app } : {}),
+        ...(contract.ports.e2e !== undefined ? { e2e: contract.ports.e2e } : {}),
+        ...(allocatedPorts.app !== undefined ? { app: allocatedPorts.app } : {}),
+        ...(allocatedPorts.e2e !== undefined ? { e2e: allocatedPorts.e2e } : {})
+      }
+    };
+    await ensureDir(path.dirname(worktreePath));
+    await addWorktree(this.config.repoRoot, worktreePath, branchName, baseBranch);
+    const baseCommit = await currentCommit(this.config.repoRoot, baseBranch);
+
+    this.db.insertWorktree({
+      id: worktreeId,
+      projectId: this.config.projectId,
+      taskId: normalized.id,
+      worktreePath,
+      branchName,
+      baseBranch,
+      baseCommit,
+      appPort: normalized.ports.app,
+      e2ePort: normalized.ports.e2e
+    });
+    if (normalized.ports.app !== undefined) {
+      this.db.addPortLease(this.config.projectId, worktreeId, "app", normalized.ports.app);
+    }
+    if (normalized.ports.e2e !== undefined) {
+      this.db.addPortLease(this.config.projectId, worktreeId, "e2e", normalized.ports.e2e);
+    }
+
+    const envFilePath = path.join(worktreePath, ".factory.env");
+    const envText = [
+      `FACTORY_TASK_ID=${normalized.id}`,
+      `FACTORY_BRANCH=${branchName}`,
+      normalized.ports.app !== undefined ? `PORT=${normalized.ports.app}` : undefined,
+      normalized.ports.app !== undefined ? `FACTORY_APP_PORT=${normalized.ports.app}` : undefined,
+      normalized.ports.e2e !== undefined ? `FACTORY_E2E_PORT=${normalized.ports.e2e}` : undefined
+    ]
+      .filter((line): line is string => Boolean(line))
+      .join("\n");
+    await writeText(envFilePath, `${envText}\n`);
+
+    await runCommand("bash", [path.resolve(this.config.repoRoot, this.config.scripts.bootstrapWorktree), worktreePath], {
+      cwd: this.config.repoRoot,
+      env: {
+        FACTORY_TASK_ID: normalized.id,
+        FACTORY_BRANCH: branchName,
+        ...(normalized.ports.app !== undefined
+          ? { PORT: String(normalized.ports.app), FACTORY_APP_PORT: String(normalized.ports.app) }
+          : {}),
+        ...(normalized.ports.e2e !== undefined
+          ? { FACTORY_E2E_PORT: String(normalized.ports.e2e) }
+          : {})
+      },
+      allowNonZeroExit: true
+    });
+
+    const runId = randomId("run");
+    const runDir = path.join(this.paths.runsDir, runId);
+    await ensureDir(runDir);
+    const jsonlLogPath = path.join(runDir, "events.jsonl");
+    const finalMessagePath = path.join(runDir, "final.json");
+    const stdoutFd = await open(jsonlLogPath, "a");
+    const stderrFd = await open(path.join(runDir, "stderr.log"), "a");
+    const prompt = await this.buildWorkerPrompt(normalized, role);
+    const schemaPath =
+      role === "review"
+        ? this.reviewerSchemaPath
+        : role === "test"
+          ? this.testerSchemaPath
+          : this.workerSchemaPath;
+
+    const child = spawn(
+      "codex",
+      [
+        "exec",
+        "--json",
+        "-C",
+        worktreePath,
+        "-m",
+        this.config.codex.model,
+        "-s",
+        this.config.codex.sandboxMode,
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        `model_reasoning_effort="${mapReasoningEffort(contract.runtime.reasoningEffort)}"`,
+        "--output-schema",
+        schemaPath,
+        "--output-last-message",
+        finalMessagePath,
+        ...(this.config.codex.searchEnabled ? ["--search"] : []),
+        "-"
+      ],
+      {
+        cwd: this.config.repoRoot,
+        env: {
+          ...process.env,
+          CODEX_HOME: process.env.CODEX_HOME ?? path.join(this.config.repoRoot, ".codex-home"),
+          FACTORY_TASK_ID: normalized.id,
+          FACTORY_BRANCH: branchName,
+          ...(normalized.ports.app !== undefined
+            ? { PORT: String(normalized.ports.app), FACTORY_APP_PORT: String(normalized.ports.app) }
+            : {}),
+          ...(normalized.ports.e2e !== undefined
+            ? { FACTORY_E2E_PORT: String(normalized.ports.e2e) }
+            : {})
+        },
+        stdio: ["pipe", stdoutFd.fd, stderrFd.fd]
+      }
+    );
+    stdoutFd.close().catch(() => undefined);
+    stderrFd.close().catch(() => undefined);
+    child.stdin?.write(prompt);
+    child.stdin?.end();
+
+    this.workerChildren.set(normalized.id, child);
+    this.db.insertRun({
+      id: runId,
+      projectId: this.config.projectId,
+      taskId: normalized.id,
+      role,
+      attempt: 1,
+      status: "running",
+      runDirectory: runDir,
+      jsonlLogPath,
+      finalMessagePath,
+      maxRuntimeMinutes: contract.runtime.maxRuntimeMinutes,
+      pid: child.pid
+    });
+    this.db.upsertAgent({
+      id: `agent-${normalized.id}`,
+      projectId: this.config.projectId,
+      role,
+      status: "running",
+      taskId: normalized.id,
+      branch: branchName,
+      worktreePath,
+      pid: child.pid
+    });
+    this.db.updateTaskStatus(normalized.id, "running");
+    this.db.insertTaskEvent(normalized.id, "started", `Started ${role} worker`);
+
+    child.on("exit", async () => {
+      try {
+        await this.handleWorkerExit(normalized, role, runId, finalMessagePath);
+      } catch (error) {
+        console.error(`worker exit handling failed: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        this.workerChildren.delete(normalized.id);
+      }
+    });
+  }
+
+  private async handleWorkerExit(
+    contract: TaskContract,
+    role: "code" | "review" | "test",
+    runId: string,
+    finalMessagePath: string
+  ): Promise<void> {
+    const schemaPath =
+      role === "review"
+        ? this.reviewerSchemaPath
+        : role === "test"
+          ? this.testerSchemaPath
+          : this.workerSchemaPath;
+    const raw = await readText(finalMessagePath).catch(() => "{}");
+    const parsed = JSON.parse(raw) as unknown;
+    const validated =
+      role === "review"
+        ? await validateWithSchema<ReviewerResult>(schemaPath, parsed)
+        : role === "test"
+          ? await validateWithSchema<TesterResult>(schemaPath, parsed)
+          : await validateWithSchema<CodingWorkerResult>(schemaPath, parsed);
+
+    if (!validated.valid) {
+      this.db.finishRun(runId, "failed");
+      this.db.updateTaskStatus(contract.id, "failed");
+      this.db.insertTaskEvent(contract.id, "failed", `Schema validation failed: ${validated.errors.join("; ")}`);
+      this.db.upsertAgent({
+        id: `agent-${contract.id}`,
+        projectId: this.config.projectId,
+        role,
+        status: "failed",
+        taskId: contract.id,
+        branch: contract.branchName,
+        worktreePath: contract.worktreePath
+      });
+      this.pendingManagerWakeReasons.add("worker_failed");
+      return;
+    }
+
+    this.db.finishRun(runId, validated.value.status);
+    this.db.upsertAgent({
+      id: `agent-${contract.id}`,
+      projectId: this.config.projectId,
+      role,
+      status:
+        validated.value.status === "completed"
+          ? "completed"
+          : validated.value.status === "blocked"
+            ? "blocked"
+            : "failed",
+      taskId: contract.id,
+      branch: contract.branchName,
+      worktreePath: contract.worktreePath
+    });
+
+    if (role === "code") {
+      const result = validated.value as CodingWorkerResult;
+      const nextStatus = result.status === "completed" ? (result.needsReview ? "review" : "done") : result.status;
+      this.db.updateTaskStatus(contract.id, nextStatus as never);
+      this.db.insertTaskEvent(contract.id, result.status, result.summary, result);
+    } else {
+      const result = validated.value as ReviewerResult | TesterResult;
+      this.db.updateTaskStatus(contract.id, result.status === "completed" ? "done" : (result.status as never));
+      this.db.insertTaskEvent(contract.id, result.status, result.summary, result);
+    }
+
+    this.pendingManagerWakeReasons.add("worker_terminal");
+  }
+
+  private async handleDeploymentIntent(
+    intent: ManagerTurnOutput["deployments"][number]
+  ): Promise<void> {
+    if (intent.kind === "deploy_preview") {
+      const commit = intent.commit ?? (await currentCommit(this.config.repoRoot, this.config.candidateBranch));
+      await this.deployPreview(commit, intent.reason);
+      return;
+    }
+
+    if (intent.kind === "promote_candidate") {
+      const commit = intent.commit ?? (await currentCommit(this.config.repoRoot, this.config.candidateBranch));
+      await this.promoteCandidate(commit, intent.reason);
+      return;
+    }
+
+    const commit = await this.resolveRollbackCommit(intent.rollbackTag, intent.commit);
+    await this.rollbackStable(commit, intent.reason, intent.rollbackTag);
+  }
+
+  private async reconcileRuntimeTargets(): Promise<void> {
+    const snapshot = this.db.getDeploymentSnapshot(this.config.projectId);
+    if (snapshot.stable.commit) {
+      await this.ensureStableProxyServer();
+      const activeSlot = snapshot.stable.activeSlot;
+      const activePort = this.runtimeSlotPort(activeSlot);
+      const stableScript = this.config.scripts.serveStable;
+      if (isPlaceholderScript(stableScript)) {
+        if (snapshot.stable.status !== "down") {
+          this.db.recordDeployment({
+            projectId: this.config.projectId,
+            target: "stable",
+            status: "down",
+            url: `http://127.0.0.1:${this.config.ports.stableProxy}`,
+            commit: snapshot.stable.commit,
+            activeSlot,
+            reason: "stable serve script not configured"
+          });
+        }
+      } else if (!(await this.ensureRuntimeProcess(activeSlot, snapshot.stable.commit, stableScript, activePort))) {
+        this.db.recordDeployment({
+          projectId: this.config.projectId,
+          target: "stable",
+          status: "down",
+          url: `http://127.0.0.1:${this.config.ports.stableProxy}`,
+          commit: snapshot.stable.commit,
+          activeSlot,
+          reason: "stable slot failed healthcheck"
+        });
+      }
+    } else {
+      await this.bootstrapStableRuntime();
+    }
+
+    if (snapshot.preview.commit) {
+      const previewScript = this.config.scripts.servePreview;
+      if (isPlaceholderScript(previewScript)) {
+        if (snapshot.preview.status !== "down") {
+          this.db.recordDeployment({
+            projectId: this.config.projectId,
+            target: "preview",
+            status: "down",
+            url: `http://127.0.0.1:${this.config.ports.preview}`,
+            commit: snapshot.preview.commit,
+            reason: "preview serve script not configured"
+          });
+        }
+      } else if (
+        !(await this.ensureRuntimeProcess(
+          "preview",
+          snapshot.preview.commit,
+          previewScript,
+          this.config.ports.preview
+        ))
+      ) {
+        this.db.recordDeployment({
+          projectId: this.config.projectId,
+          target: "preview",
+          status: "down",
+          url: `http://127.0.0.1:${this.config.ports.preview}`,
+          commit: snapshot.preview.commit,
+          reason: "preview slot failed healthcheck"
+        });
+      }
+    }
+  }
+
+  private async bootstrapStableRuntime(): Promise<void> {
+    const serveScript = this.config.scripts.serveStable;
+    if (isPlaceholderScript(serveScript)) {
+      return;
+    }
+
+    const commit = await currentCommit(this.config.repoRoot, this.config.defaultBranch);
+    const success = await this.ensureRuntimeProcess(
+      "stable-a",
+      commit,
+      serveScript,
+      this.config.ports.stableA
+    );
+    await this.ensureStableProxyServer();
+    this.db.recordDeployment({
+      projectId: this.config.projectId,
+      target: "stable",
+      status: success ? "healthy" : "down",
+      url: `http://127.0.0.1:${this.config.ports.stableProxy}`,
+      commit,
+      activeSlot: "stable-a",
+      reason: success ? "bootstrap stable runtime" : "bootstrap stable runtime failed"
+    });
+  }
+
+  private async deployPreview(commit: string, reason: string): Promise<void> {
+    const script = this.config.scripts.servePreview;
+    if (isPlaceholderScript(script)) {
+      throw new Error("Preview serve script is not configured");
+    }
+
+    const success = await this.ensureRuntimeProcess(
+      "preview",
+      commit,
+      script,
+      this.config.ports.preview
+    );
+    this.db.recordDeployment({
+      projectId: this.config.projectId,
+      target: "preview",
+      status: success ? "healthy" : "down",
+      url: `http://127.0.0.1:${this.config.ports.preview}`,
+      commit,
+      reason
+    });
+    await this.sendTelegramMessage(
+      success ? "info_update" : "incident_alert",
+      success
+        ? `Preview updated to ${commit.slice(0, 12)}. ${reason}`
+        : `Preview deployment failed for ${commit.slice(0, 12)}. ${reason}`
+    );
+  }
+
+  private async promoteCandidate(commit: string, reason: string): Promise<void> {
+    const serveScript = this.config.scripts.serveStable;
+    if (isPlaceholderScript(serveScript)) {
+      throw new Error("Stable serve script is not configured");
+    }
+
+    const currentStable = this.db.getDeploymentSnapshot(this.config.projectId).stable;
+    const nextSlot: RuntimeSlotName = currentStable.activeSlot === "stable-a" ? "stable-b" : "stable-a";
+    const success = await this.ensureRuntimeProcess(
+      nextSlot,
+      commit,
+      serveScript,
+      this.runtimeSlotPort(nextSlot)
+    );
+    this.db.recordDeployment({
+      projectId: this.config.projectId,
+      target: "stable",
+      status: success ? "healthy" : "down",
+      url: `http://127.0.0.1:${this.config.ports.stableProxy}`,
+      commit,
+      activeSlot: nextSlot,
+      reason
+    });
+    if (!success) {
+      await this.sendTelegramMessage(
+        "incident_alert",
+        `Stable promotion failed for ${commit.slice(0, 12)}. ${reason}`
+      );
+      return;
+    }
+
+    await this.ensureStableProxyServer();
+    const tag = `stable-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    this.db.insertReleaseTag(this.config.projectId, tag, commit);
+    await this.sendTelegramMessage(
+      "ship_result",
+      `Stable is live at ${commit.slice(0, 12)} on ${nextSlot}. ${reason}`
+    );
+  }
+
+  private async rollbackStable(
+    commit: string,
+    reason: string,
+    rollbackTag?: string
+  ): Promise<void> {
+    const serveScript = this.config.scripts.serveStable;
+    if (isPlaceholderScript(serveScript)) {
+      throw new Error("Stable serve script is not configured");
+    }
+
+    const currentStable = this.db.getDeploymentSnapshot(this.config.projectId).stable;
+    const nextSlot: RuntimeSlotName = currentStable.activeSlot === "stable-a" ? "stable-b" : "stable-a";
+    const success = await this.ensureRuntimeProcess(
+      nextSlot,
+      commit,
+      serveScript,
+      this.runtimeSlotPort(nextSlot)
+    );
+    this.db.recordDeployment({
+      projectId: this.config.projectId,
+      target: "stable",
+      status: success ? "healthy" : "down",
+      url: `http://127.0.0.1:${this.config.ports.stableProxy}`,
+      commit,
+      activeSlot: nextSlot,
+      reason: rollbackTag ? `${reason} (${rollbackTag})` : reason
+    });
+    await this.sendTelegramMessage(
+      success ? "ship_result" : "incident_alert",
+      success
+        ? `Stable rolled back to ${commit.slice(0, 12)} on ${nextSlot}. ${reason}`
+        : `Stable rollback failed for ${commit.slice(0, 12)}. ${reason}`
+    );
+  }
+
+  private async resolveRollbackCommit(
+    rollbackTag?: string,
+    explicitCommit?: string
+  ): Promise<string> {
+    if (explicitCommit) {
+      return explicitCommit;
+    }
+
+    if (rollbackTag) {
+      const tag = this.db.getReleaseTag(this.config.projectId, rollbackTag);
+      if (!tag) {
+        throw new Error(`Unknown rollback tag: ${rollbackTag}`);
+      }
+      return tag.commit;
+    }
+
+    const deployments = this.db.listDeployments(this.config.projectId, "stable", 10);
+    const currentCommit = deployments[0]?.commit;
+    const previous = deployments.find(
+      (deployment) => deployment.status === "healthy" && deployment.commit && deployment.commit !== currentCommit
+    );
+    if (!previous) {
+      throw new Error("No previous healthy stable deployment is available for rollback");
+    }
+
+    return previous.commit;
+  }
+
+  private async ensureRuntimeProcess(
+    slot: RuntimeSlotName,
+    commit: string,
+    script: string,
+    port: number
+  ): Promise<boolean> {
+    const worktreePath = this.runtimeSlotWorktreePath(slot);
+    const existing = this.runtimeProcesses.get(slot);
+    if (
+      existing &&
+      existing.child.exitCode === null &&
+      existing.commit === commit &&
+      existing.script === script
+    ) {
+      try {
+        await this.runRuntimeHealthcheck(worktreePath, port);
+        return true;
+      } catch {
+        await this.stopRuntimeProcess(slot);
+      }
+    }
+
+    await this.stopRuntimeProcess(slot);
+    await ensureDir(path.dirname(worktreePath));
+    await ensureDetachedWorktreeAtRef(this.config.repoRoot, worktreePath, commit);
+    await runCommand(
+      "bash",
+      [path.resolve(this.config.repoRoot, this.config.scripts.bootstrapWorktree), worktreePath],
+      {
+        cwd: this.config.repoRoot,
+        env: this.buildRuntimeEnvironment(port),
+        allowNonZeroExit: true
+      }
+    );
+
+    const stdoutPath = path.join(this.paths.logsDir, `${slot}.out.log`);
+    const stderrPath = path.join(this.paths.logsDir, `${slot}.err.log`);
+    const started = await spawnLoggedShellCommand({
+      script,
+      cwd: worktreePath,
+      env: this.buildRuntimeEnvironment(port),
+      stdoutPath,
+      stderrPath
+    });
+    this.runtimeProcesses.set(slot, {
+      child: started.child,
+      commit,
+      worktreePath,
+      port,
+      script
+    });
+    started.child.on("exit", () => {
+      const current = this.runtimeProcesses.get(slot);
+      if (current?.child.pid === started.child.pid) {
+        this.runtimeProcesses.delete(slot);
+      }
+    });
+
+    try {
+      await this.runRuntimeHealthcheck(worktreePath, port);
+      return true;
+    } catch (error) {
+      await this.stopRuntimeProcess(slot);
+      console.error(`${slot} healthcheck failed: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+
+  private async stopRuntimeProcess(slot: RuntimeSlotName): Promise<void> {
+    const existing = this.runtimeProcesses.get(slot);
+    if (!existing) {
+      return;
+    }
+
+    this.runtimeProcesses.delete(slot);
+    try {
+      existing.child.kill("SIGTERM");
+    } catch {
+      return;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    if (existing.child.exitCode === null) {
+      try {
+        existing.child.kill("SIGKILL");
+      } catch {
+        // Ignore already-dead children.
+      }
+    }
+  }
+
+  private runtimeSlotWorktreePath(slot: RuntimeSlotName): string {
+    return path.join(this.paths.runtimeDir, slot);
+  }
+
+  private runtimeSlotPort(slot: RuntimeSlotName): number {
+    if (slot === "stable-a") {
+      return this.config.ports.stableA;
+    }
+    if (slot === "stable-b") {
+      return this.config.ports.stableB;
+    }
+    return this.config.ports.preview;
+  }
+
+  private buildRuntimeEnvironment(port: number): NodeJS.ProcessEnv {
+    return {
+      ...process.env,
+      PORT: String(port),
+      FACTORY_APP_PORT: String(port)
+    };
+  }
+
+  private async runRuntimeHealthcheck(worktreePath: string, port: number): Promise<void> {
+    await waitForSuccessfulCommand(this.config.scripts.healthcheck, {
+      cwd: worktreePath,
+      env: this.buildRuntimeEnvironment(port),
+      timeoutMs: 60_000,
+      intervalMs: 2_000
+    });
+  }
+
+  private async ensureStableProxyServer(): Promise<void> {
+    if (this.stableProxyServer) {
+      return;
+    }
+
+    this.stableProxyServer = http.createServer((request, response) => {
+      void this.proxyStableHttp(request, response);
+    });
+    this.stableProxyServer.on("upgrade", (request, socket, head) => {
+      void this.proxyStableUpgrade(request, socket, head);
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      this.stableProxyServer?.once("error", reject);
+      this.stableProxyServer?.listen(this.config.ports.stableProxy, "127.0.0.1", () => {
+        this.stableProxyServer?.off("error", reject);
+        resolve();
+      });
+    });
+  }
+
+  private async proxyStableHttp(
+    request: http.IncomingMessage,
+    response: http.ServerResponse
+  ): Promise<void> {
+    const target = this.getStableProxyTarget();
+    if (!target) {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "stable_unavailable" }));
+      return;
+    }
+
+    const proxyRequest = http.request(
+      {
+        host: "127.0.0.1",
+        port: target.port,
+        method: request.method,
+        path: request.url,
+        headers: {
+          ...request.headers,
+          host: `127.0.0.1:${target.port}`
+        }
+      },
+      (proxyResponse) => {
+        response.writeHead(proxyResponse.statusCode ?? 502, proxyResponse.headers);
+        proxyResponse.pipe(response);
+      }
+    );
+
+    proxyRequest.on("error", (error) => {
+      if (!response.headersSent) {
+        response.writeHead(502, { "content-type": "application/json" });
+      }
+      response.end(
+        JSON.stringify({ error: "stable_proxy_error", detail: error instanceof Error ? error.message : String(error) })
+      );
+    });
+
+    request.pipe(proxyRequest);
+  }
+
+  private async proxyStableUpgrade(
+    request: http.IncomingMessage,
+    socket: Duplex,
+    head: Buffer
+  ): Promise<void> {
+    const target = this.getStableProxyTarget();
+    if (!target) {
+      socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    const upstream = net.connect(target.port, "127.0.0.1", () => {
+      const headers = Object.entries(request.headers)
+        .map(([key, value]) => `${key}: ${Array.isArray(value) ? value.join(", ") : (value ?? "")}`)
+        .join("\r\n");
+      upstream.write(
+        `${request.method ?? "GET"} ${request.url ?? "/"} HTTP/${request.httpVersion}\r\n${headers}\r\n\r\n`
+      );
+      if (head.length > 0) {
+        upstream.write(head);
+      }
+      upstream.pipe(socket);
+      socket.pipe(upstream);
+    });
+
+    upstream.on("error", () => socket.destroy());
+    socket.on("error", () => upstream.destroy());
+  }
+
+  private getStableProxyTarget(): { slot: "stable-a" | "stable-b"; port: number } | undefined {
+    const snapshot = this.db.getDeploymentSnapshot(this.config.projectId).stable;
+    if (!snapshot.commit || snapshot.status === "down") {
+      return undefined;
+    }
+
+    return {
+      slot: snapshot.activeSlot,
+      port: this.runtimeSlotPort(snapshot.activeSlot)
+    };
+  }
+
+  private async maybeSendDailyDigest(resources: ManagerTurnInput["resources"]): Promise<void> {
+    const chatId = this.config.telegram.controlChatId;
+    if (!chatId) {
+      return;
+    }
+
+    const today = localDateString(this.config.timezone);
+    const latestDigest = this.db.getLatestTelegramMessageByKind(this.config.projectId, "daily_digest");
+    if (latestDigest && localDateString(this.config.timezone, new Date(latestDigest.recordedAt)) === today) {
+      return;
+    }
+
+    const tasks = this.db.listTasks(this.config.projectId);
+    const agents = this.db.listAgents(this.config.projectId);
+    const openDecisions = this.db.listOpenDecisions(this.config.projectId);
+    const deployments = this.db.getDeploymentSnapshot(this.config.projectId);
+    const text =
+      `Daily digest ${today}\n` +
+      `Tasks queued/running/blocked/review: ${tasks.filter((task) => task.status === "queued").length}/` +
+      `${tasks.filter((task) => task.status === "running").length}/` +
+      `${tasks.filter((task) => task.status === "blocked").length}/` +
+      `${tasks.filter((task) => task.status === "review").length}\n` +
+      `Open decisions: ${openDecisions.length}\n` +
+      `Agents running: ${agents.filter((agent) => agent.status === "running").length}\n` +
+      `Stable: ${deployments.stable.status} ${deployments.stable.commit.slice(0, 12) || "none"}\n` +
+      `Preview: ${deployments.preview.status} ${deployments.preview.commit.slice(0, 12) || "none"}\n` +
+      `Free worker slots: ${resources.freeWorkerSlots}`;
+    await this.sendTelegramMessage("daily_digest", text);
+  }
+
+  private async buildWorkerPrompt(
+    contract: TaskContract,
+    role: "code" | "review" | "test"
+  ): Promise<string> {
+    const promptPath =
+      role === "review"
+        ? this.reviewerPromptPath
+        : role === "test"
+          ? this.testerPromptPath
+          : this.workerPromptPath;
+    const prompt = await readText(promptPath);
+    return `${prompt}\n\nTask contract:\n${JSON.stringify(contract, null, 2)}\n`;
+  }
+
+  private async ensureAppServer(): Promise<void> {
+    const url = this.config.codex.appServerUrl;
+    try {
+      const client = this.getAppServerClient();
+      await client.connect();
+      return;
+    } catch {
+      // Start locally below.
+    }
+
+    if (!this.appServerProcess || this.appServerProcess.exitCode !== null) {
+      const started = await spawnLoggedProcess({
+        command: "codex",
+        args: ["app-server", "--listen", url],
+        cwd: this.config.repoRoot,
+        stdoutPath: path.join(this.paths.logsDir, "app-server.out.log"),
+        stderrPath: path.join(this.paths.logsDir, "app-server.err.log")
+      });
+      this.appServerProcess = started.child;
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+
+    await this.getAppServerClient().connect();
+  }
+
+  private getAppServerClient(): AppServerClient {
+    if (!this.appServerClient) {
+      this.appServerClient = new AppServerClient(this.config.codex.appServerUrl);
+    }
+    return this.appServerClient;
+  }
+
+  private async refreshProjectState(): Promise<void> {
+    this.db.updateProjectCommits(
+      this.config.projectId,
+      await currentCommit(this.config.repoRoot, this.config.defaultBranch),
+      await currentCommit(this.config.repoRoot, this.config.candidateBranch)
+    );
+  }
+
+  private async startDashboardServer(): Promise<void> {
+    if (this.dashboardServer) {
+      return;
+    }
+
+    this.dashboardServer = http.createServer(async (request, response) => {
+      try {
+        const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
+        if (request.method === "GET" && url.pathname === "/health") {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(JSON.stringify({ ok: true, now: nowIso() }));
+          return;
+        }
+
+        if (request.method === "GET" && url.pathname === "/status") {
+          const tasks = this.db.listTasks(this.config.projectId);
+          const agents = this.db.listAgents(this.config.projectId);
+          const deployments = this.db.getDeploymentSnapshot(this.config.projectId);
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(
+            JSON.stringify(
+              {
+                projectId: this.config.projectId,
+                bootstrapStatus: this.config.bootstrap.status,
+                tasks,
+                agents,
+                deployments
+              },
+              null,
+              2
+            )
+          );
+          return;
+        }
+
+        if (request.method === "POST" && url.pathname === "/telegram/webhook") {
+          await this.handleTelegramWebhook(request, response);
+          return;
+        }
+
+        response.writeHead(404, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "not_found" }));
+      } catch (error) {
+        response.writeHead(500, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+      }
+    });
+
+    await new Promise<void>((resolve) => {
+      this.dashboardServer?.listen(this.config.ports.dashboard, "127.0.0.1", () => resolve());
+    });
+  }
+
+  private async handleTelegramWebhook(
+    request: http.IncomingMessage,
+    response: http.ServerResponse
+  ): Promise<void> {
+    const botToken = process.env[this.config.telegram.botTokenEnvVar];
+    const expectedSecret = process.env[this.config.telegram.webhookSecretEnvVar];
+    if (!expectedSecret) {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "webhook secret not configured" }));
+      return;
+    }
+
+    if (request.headers["x-telegram-bot-api-secret-token"] !== expectedSecret) {
+      response.writeHead(403, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "invalid_secret" }));
+      return;
+    }
+
+    const body = await new Promise<string>((resolve, reject) => {
+      let chunks = "";
+      request.setEncoding("utf8");
+      request.on("data", (chunk) => {
+        chunks += chunk;
+      });
+      request.on("end", () => resolve(chunks));
+      request.on("error", reject);
+    });
+    const update = JSON.parse(body) as Record<string, unknown>;
+    const message = update.message as
+      | { message_id?: number; text?: string; chat?: { id?: string | number; type?: string }; from?: { id?: string | number } }
+      | undefined;
+    const callbackQuery = update.callback_query as
+      | {
+          id?: string;
+          data?: string;
+          from?: { id?: string | number };
+          message?: { message_id?: number; chat?: { id?: string | number; type?: string } };
+        }
+      | undefined;
+
+    if (
+      message?.text &&
+      this.isTelegramActorAllowed(
+        message.chat?.id ? String(message.chat.id) : undefined,
+        message.from?.id ? String(message.from.id) : undefined,
+        message.chat?.type
+      )
+    ) {
+      const inboxId = randomId("inbox");
+      this.db.insertInboxItem({
+        id: inboxId,
+        projectId: this.config.projectId,
+        source: "telegram",
+        externalId: message.message_id ? String(message.message_id) : undefined,
+        receivedAt: nowIso(),
+        text: message.text,
+        status: "new"
+      });
+      this.db.insertTelegramMessage({
+        id: randomId("telegram"),
+        projectId: this.config.projectId,
+        telegramMessageId: message.message_id ? String(message.message_id) : undefined,
+        chatId: message.chat?.id ? String(message.chat.id) : undefined,
+        direction: "inbound",
+        kind: "message",
+        text: message.text
+      });
+      await this.interruptManagerIfRunning();
+      this.pendingManagerWakeReasons.add("telegram_message");
+    }
+
+    if (
+      callbackQuery?.data?.startsWith("decision:") &&
+      this.isTelegramActorAllowed(
+        callbackQuery.message?.chat?.id ? String(callbackQuery.message.chat.id) : undefined,
+        callbackQuery.from?.id ? String(callbackQuery.from.id) : undefined,
+        callbackQuery.message?.chat?.type
+      )
+    ) {
+      const [, decisionId, optionId] = callbackQuery.data.split(":");
+      if (decisionId && optionId) {
+        const decision = this.db.getDecision(decisionId);
+        if (!decision) {
+          await this.answerTelegramCallback(botToken, callbackQuery.id, "Decision not found");
+        } else if (decision.status !== "open") {
+          await this.answerTelegramCallback(
+            botToken,
+            callbackQuery.id,
+            `Decision already ${decision.status.replace("_", " ")}`
+          );
+        } else if (!decision.options.some((option) => option.id === optionId)) {
+          await this.answerTelegramCallback(botToken, callbackQuery.id, "Invalid option");
+        } else {
+          this.db.resolveDecision(decisionId, "resolved", optionId);
+          this.db.insertTelegramMessage({
+            id: randomId("telegram"),
+            projectId: this.config.projectId,
+            telegramMessageId: callbackQuery.message?.message_id
+              ? String(callbackQuery.message.message_id)
+              : undefined,
+            chatId: callbackQuery.message?.chat?.id
+              ? String(callbackQuery.message.chat.id)
+              : undefined,
+            direction: "inbound",
+            kind: "decision_callback",
+            text: `${decisionId}:${optionId}`,
+            decisionId
+          });
+          const requeuedTasks = this.db.requeueSatisfiedBlockedTasks(this.config.projectId);
+          for (const taskId of requeuedTasks) {
+            this.db.insertTaskEvent(taskId, "queued", "Task re-queued after decision reply");
+          }
+          await this.answerTelegramCallback(
+            botToken,
+            callbackQuery.id,
+            `Recorded: ${decision.options.find((option) => option.id === optionId)?.label ?? optionId}`
+          );
+          await this.interruptManagerIfRunning();
+          this.pendingManagerWakeReasons.add("decision_reply");
+        }
+      }
+    }
+
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true }));
+  }
+
+  private isTelegramActorAllowed(
+    chatId?: string,
+    userId?: string,
+    chatType?: string
+  ): boolean {
+    if (!chatId) {
+      return false;
+    }
+
+    const allowListed =
+      this.config.telegram.allowedAdminUserIds.length === 0 ||
+      (userId !== undefined && this.config.telegram.allowedAdminUserIds.includes(userId));
+    if (!allowListed) {
+      return false;
+    }
+
+    if (chatId === this.config.telegram.controlChatId) {
+      return true;
+    }
+
+    return Boolean(this.config.telegram.allowAdminDm && chatType === "private");
+  }
+
+  private async answerTelegramCallback(
+    botToken: string | undefined,
+    callbackId: string | undefined,
+    text: string
+  ): Promise<void> {
+    if (!botToken || !callbackId) {
+      return;
+    }
+
+    await sendTelegramApiRequest(botToken, "answerCallbackQuery", {
+      callback_query_id: callbackId,
+      text
+    }).catch(() => undefined);
+  }
+
+  private async interruptManagerIfRunning(): Promise<void> {
+    if (!this.activeManagerThreadId || !this.activeManagerTurnId) {
+      return;
+    }
+
+    try {
+      await this.getAppServerClient().interruptTurn(this.activeManagerThreadId, this.activeManagerTurnId);
+    } catch {
+      // Ignore interruptions failing during normal shutdown races.
+    }
+  }
+}
+
+function mapReasoningEffort(effort: TaskContract["runtime"]["reasoningEffort"]): string {
+  if (effort === "extra-high") {
+    return "high";
+  }
+  return effort;
+}

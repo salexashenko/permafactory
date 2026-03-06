@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "baseUrl": ".",
+    "paths": {
+      "@permafactory/models": [
+        "packages/models/src/index.ts"
+      ],
+      "@permafactory/config": [
+        "packages/config/src/index.ts"
+      ],
+      "@permafactory/db": [
+        "packages/db/src/index.ts"
+      ],
+      "@permafactory/runtime": [
+        "packages/runtime/src/index.ts"
+      ]
+    }
+  }
+}
