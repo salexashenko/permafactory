@@ -218,7 +218,7 @@ export function renderFactoryConfig(config: FactoryProjectConfig): string {
 }
 
 export function renderEnvExample(config: FactoryProjectConfig): string {
-  return `${config.telegram.botTokenEnvVar}=replace-me\n${config.telegram.webhookSecretEnvVar}=replace-me\n`;
+  return `# Copy this file to .env.factory for local CLI use.\n# Create the bot token with @BotFather -> /newbot.\n${config.telegram.botTokenEnvVar}=replace-me\n# Generate with: openssl rand -hex 32\n${config.telegram.webhookSecretEnvVar}=replace-me\n`;
 }
 
 export function renderAgentsStub(projectId: string): string {
@@ -248,6 +248,60 @@ fi
 `;
 }
 
+const LEGACY_ONBOARDING_PLACEHOLDER =
+  "# Factory Onboarding Summary\n\nThis file will be populated by bootstrap runs.\n";
+
+export function renderOnboardingSummary(config: FactoryProjectConfig): string {
+  return `# Factory Onboarding Summary
+
+## Immediate Next Step: Telegram Bootstrap
+
+The factory is waiting for a Telegram control chat before it can operate normally.
+
+1. Open Telegram and start a chat with \`@BotFather\`.
+2. Send \`/newbot\`.
+3. Choose a display name and a bot username ending in \`bot\`.
+4. Copy the HTTP API token from BotFather into \`.env.factory\` as \`${config.telegram.botTokenEnvVar}=...\`.
+5. If this bot will read normal messages in the control supergroup, send \`/setprivacy\` in BotFather, choose this bot, and disable privacy mode.
+6. Generate a webhook secret and store it as \`${config.telegram.webhookSecretEnvVar}\`.
+
+## Local Env File
+
+Create \`.env.factory\` in the repo root. You can start from \`.env.factory.example\`.
+
+Example:
+
+\`\`\`env
+${config.telegram.botTokenEnvVar}=replace-me
+${config.telegram.webhookSecretEnvVar}=replace-me
+\`\`\`
+
+Generate the webhook secret with:
+
+\`\`\`bash
+openssl rand -hex 32
+\`\`\`
+
+## Control Chat Binding
+
+1. Create or choose a Telegram supergroup that will act as the factory control room.
+2. Add the bot to that supergroup.
+3. From a shell with \`.env.factory\` loaded, run:
+
+\`\`\`bash
+factoryctl telegram connect --repo ${config.repoRoot} --bot-token-env ${config.telegram.botTokenEnvVar}
+\`\`\`
+
+4. Send \`/hello\` in the supergroup.
+5. If you already have the public dashboard URL, rerun with \`--webhook-url https://your-host/telegram/webhook\`.
+
+## Notes
+
+- \`factoryctl telegram connect\` binds the chat, records the first admin user, and can configure the production webhook.
+- Until Telegram is connected, bootstrap status remains \`waiting_for_telegram\`.
+`;
+}
+
 export async function initializeFactoryLayout(repoRoot: string): Promise<void> {
   const paths = getFactoryPaths(repoRoot);
   await Promise.all([
@@ -269,11 +323,17 @@ export async function writeBootstrapArtifacts(
   await writeText(path.join(config.repoRoot, ".env.factory.example"), renderEnvExample(config));
   await writeTextIfAbsent(path.join(config.repoRoot, "AGENTS.md"), renderAgentsStub(projectId));
   await writeText(paths.bootstrapScriptPath, renderBootstrapScript());
-  await ensureDir(path.dirname(path.join(config.repoRoot, config.bootstrap.onboardingSummaryPath)));
-  await writeTextIfAbsent(
-    path.join(config.repoRoot, config.bootstrap.onboardingSummaryPath),
-    "# Factory Onboarding Summary\n\nThis file will be populated by bootstrap runs.\n"
-  );
+  const onboardingPath = path.join(config.repoRoot, config.bootstrap.onboardingSummaryPath);
+  await ensureDir(path.dirname(onboardingPath));
+  if (!(await fileExists(onboardingPath))) {
+    await writeText(onboardingPath, renderOnboardingSummary(config));
+    return;
+  }
+
+  const existing = await readText(onboardingPath);
+  if (existing === LEGACY_ONBOARDING_PLACEHOLDER) {
+    await writeText(onboardingPath, renderOnboardingSummary(config));
+  }
 }
 
 export async function detectLikelyDefaultBranch(repoRoot: string): Promise<string | undefined> {

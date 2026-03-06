@@ -28,6 +28,7 @@ import {
   getFactoryPaths,
   isPlaceholderScript,
   listDirtyFiles,
+  loadEnvFile,
   localDateString,
   nowIso,
   randomId,
@@ -83,6 +84,7 @@ async function main(): Promise<void> {
   });
 
   const repoRoot = path.resolve(parsed.values.repo ?? process.cwd());
+  await loadEnvFile(path.join(repoRoot, ".env.factory"));
   const config = await loadProjectConfig(repoRoot);
   const db = await FactoryDatabase.open(repoRoot);
   db.init();

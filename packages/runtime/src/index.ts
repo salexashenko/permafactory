@@ -119,6 +119,46 @@ export async function writeJson(filePath: string, value: unknown): Promise<void>
   await writeText(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+export async function loadEnvFile(filePath: string): Promise<string[]> {
+  if (!(await fileExists(filePath))) {
+    return [];
+  }
+
+  const content = await readText(filePath);
+  const loadedKeys: string[] = [];
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+
+    const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) {
+      continue;
+    }
+
+    const [, key, rawValue] = match;
+    if (!key) {
+      continue;
+    }
+
+    let value = rawValue ?? "";
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+      loadedKeys.push(key);
+    }
+  }
+
+  return loadedKeys;
+}
+
 export async function runCommand(
   command: string,
   args: string[],

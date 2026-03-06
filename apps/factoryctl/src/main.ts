@@ -12,6 +12,7 @@ import {
   fileExists,
   getFactoryPaths,
   isGitRepo,
+  loadEnvFile,
   nowIso,
   parseTopLevelBacklogItems,
   pollTelegramUpdates,
@@ -92,12 +93,32 @@ function requireString(value: string | undefined, name: string): string {
   return value;
 }
 
+async function loadRepoEnv(repoRoot: string): Promise<void> {
+  await loadEnvFile(path.join(repoRoot, ".env.factory"));
+}
+
 async function openProject(repoRoot: string): Promise<{ config: FactoryProjectConfig; db: FactoryDatabase }> {
+  await loadRepoEnv(repoRoot);
   const config = await loadProjectConfig(repoRoot);
   const db = await FactoryDatabase.open(repoRoot);
   db.init();
   db.upsertProject(config);
   return { config, db };
+}
+
+function renderTelegramSetupGuide(config: FactoryProjectConfig): string {
+  return [
+    "",
+    "Telegram setup",
+    `1. Open Telegram and start a chat with @BotFather.`,
+    "2. Send /newbot and follow the prompts for the bot name and username.",
+    `3. Put the token into ${path.join(config.repoRoot, ".env.factory")} as ${config.telegram.botTokenEnvVar}=...`,
+    "4. If the control room will use normal group messages, run /setprivacy in BotFather and disable privacy mode for this bot.",
+    `5. Generate ${config.telegram.webhookSecretEnvVar}, for example: openssl rand -hex 32`,
+    `6. Add the bot to a Telegram supergroup and run: factoryctl telegram connect --repo ${config.repoRoot} --bot-token-env ${config.telegram.botTokenEnvVar}`,
+    "7. Send /hello in that supergroup to bind it.",
+    `More detail: ${path.join(config.repoRoot, config.bootstrap.onboardingSummaryPath)}`
+  ].join("\n");
 }
 
 async function handleInit(args: string[]): Promise<void> {
@@ -118,6 +139,7 @@ async function handleInit(args: string[]): Promise<void> {
   const projectSpecPath = parsed.values["project-spec-path"];
 
   await withProjectLock(repoRoot, async () => {
+    await loadRepoEnv(repoRoot);
     if (!(await isGitRepo(repoRoot))) {
       throw new Error(`${repoRoot} is not a git repository`);
     }
@@ -162,6 +184,8 @@ async function handleInit(args: string[]): Promise<void> {
     console.log(`config: ${getConfigPath(repoRoot)}`);
     console.log(`candidate branch: ${config.candidateBranch}`);
     console.log(`project spec: ${config.projectSpecPath}`);
+    console.log(`env template: ${path.join(repoRoot, ".env.factory.example")}`);
+    console.log(renderTelegramSetupGuide(config));
   });
 }
 
@@ -451,6 +475,7 @@ async function handleStart(args: string[]): Promise<void> {
   });
 
   const repoRoot = path.resolve(requireString(parsed.values.repo, "--repo"));
+  await loadRepoEnv(repoRoot);
   const factorydEntrypoint = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
     "../../factoryd/src/main.ts"
