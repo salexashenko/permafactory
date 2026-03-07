@@ -20,9 +20,12 @@ import { spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import type {
+  DecisionRequest,
   DecisionBudgetSnapshot,
   FactoryProjectConfig,
+  ManagerTurnOutput,
   PortLeaseRequirement,
+  ReasoningEffort,
   TaskContract
 } from "@permafactory/models";
 
@@ -56,6 +59,24 @@ export interface FactoryPaths {
   scriptsDir: string;
   bootstrapScriptPath: string;
   lockPath: string;
+}
+
+export interface NormalizeManagerTurnOutputOptions {
+  candidateBranch: string;
+  worktreesDir: string;
+  now?: string;
+  createId?: (prefix: string) => string;
+}
+
+export interface ReachableHostCandidates {
+  tailscaleDnsName?: string;
+  tailscaleIp?: string;
+  lanIp?: string;
+}
+
+export interface ReachableHostResolution {
+  host: string;
+  source: "tailscale-dns" | "tailscale-ip" | "lan-ip" | "localhost";
 }
 
 export function getFactoryPaths(repoRoot: string): FactoryPaths {
@@ -354,6 +375,558 @@ export function randomId(prefix: string): string {
 
 export function nowIso(): string {
   return new Date().toISOString();
+}
+
+function normalizeHost(value: string | undefined): string | undefined {
+  const normalized = value?.trim().replace(/\.$/, "");
+  return normalized && normalized.length > 0 ? normalized : undefined;
+}
+
+export function selectReachableHost(candidates: ReachableHostCandidates): ReachableHostResolution {
+  const tailscaleDnsName = normalizeHost(candidates.tailscaleDnsName);
+  if (tailscaleDnsName) {
+    return { host: tailscaleDnsName, source: "tailscale-dns" };
+  }
+
+  const tailscaleIp = normalizeHost(candidates.tailscaleIp);
+  if (tailscaleIp) {
+    return { host: tailscaleIp, source: "tailscale-ip" };
+  }
+
+  const lanIp = normalizeHost(candidates.lanIp);
+  if (lanIp) {
+    return { host: lanIp, source: "lan-ip" };
+  }
+
+  return { host: "127.0.0.1", source: "localhost" };
+}
+
+export function formatHttpUrl(host: string, port: number): string {
+  const normalizedHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return `http://${normalizedHost}:${port}`;
+}
+
+export function shouldDeliverTelegramNotification(
+  kind: string,
+  options: { isDirectUserResponse?: boolean } = {}
+): boolean {
+  if (kind === "decision_required" || kind === "ship_result" || kind === "daily_digest") {
+    return true;
+  }
+
+  if (kind === "info_update") {
+    return options.isDirectUserResponse === true;
+  }
+
+  return false;
+}
+
+function pickTailscaleIp(value: unknown): string | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const ips = value
+    .map((entry) => stringValue(entry))
+    .filter((entry): entry is string => Boolean(entry));
+  return ips.find((ip) => !ip.includes(":")) ?? ips[0];
+}
+
+function firstNonLoopbackIpv4(): string | undefined {
+  const interfaces = os.networkInterfaces();
+  for (const addresses of Object.values(interfaces)) {
+    if (!addresses) {
+      continue;
+    }
+
+    for (const address of addresses) {
+      if (address.internal || address.family !== "IPv4") {
+        continue;
+      }
+      if (address.address.startsWith("169.254.")) {
+        continue;
+      }
+      return address.address;
+    }
+  }
+
+  return undefined;
+}
+
+async function resolveTailscaleHostCandidates(): Promise<ReachableHostCandidates> {
+  try {
+    const { stdout } = await execFileAsync("tailscale", ["status", "--json"], {
+      maxBuffer: 2 * 1024 * 1024
+    });
+    const parsed = JSON.parse(stdout) as Record<string, unknown>;
+    const self = asRecord(parsed.Self);
+    return {
+      tailscaleDnsName: firstString(self?.DNSName),
+      tailscaleIp: pickTailscaleIp(self?.TailscaleIPs ?? parsed.TailscaleIPs)
+    };
+  } catch {
+    return {};
+  }
+}
+
+export async function resolveReachableHttpUrl(port: number): Promise<string> {
+  const tailscale = await resolveTailscaleHostCandidates();
+  const selected = selectReachableHost({
+    ...tailscale,
+    lanIp: firstNonLoopbackIpv4()
+  });
+  return formatHttpUrl(selected.host, port);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    const stringified = stringValue(value);
+    if (stringified) {
+      return stringified;
+    }
+  }
+
+  return undefined;
+}
+
+function stringArray(value: unknown): string[] {
+  if (typeof value === "string") {
+    return value
+      .split(/\r?\n|,/)
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+  }
+
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((entry) => stringValue(entry))
+    .filter((entry): entry is string => Boolean(entry));
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function booleanValue(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function normalizeTelegramKind(value: unknown): ManagerTurnOutput["userMessages"][number]["kind"] {
+  switch (firstString(value)?.toLowerCase()) {
+    case "decision_required":
+    case "decision":
+      return "decision_required";
+    case "incident_alert":
+    case "incident":
+    case "alert":
+    case "error":
+      return "incident_alert";
+    case "ship_result":
+    case "ship":
+    case "deploy":
+    case "release":
+      return "ship_result";
+    case "daily_digest":
+    case "digest":
+      return "daily_digest";
+    case "info_update":
+    case "info":
+    case "update":
+    case "reply":
+    case "response":
+    case "status":
+    default:
+      return "info_update";
+  }
+}
+
+function normalizeTaskKind(value: unknown): TaskContract["kind"] {
+  switch (firstString(value)?.toLowerCase()) {
+    case "review-fix":
+    case "review_fix":
+    case "reviewfix":
+    case "followup":
+      return "review-fix";
+    case "test":
+    case "testing":
+    case "qa":
+      return "test";
+    case "maintenance":
+    case "chore":
+    case "docs":
+    case "cleanup":
+      return "maintenance";
+    case "code":
+    case "coding":
+    case "feature":
+    case "implementation":
+    case "fix":
+    case "bugfix":
+    default:
+      return "code";
+  }
+}
+
+function normalizeReasoningEffort(value: unknown, title: string, goal: string): ReasoningEffort {
+  const explicit = firstString(value)?.toLowerCase();
+  if (explicit === "medium" || explicit === "extra-high") {
+    return explicit;
+  }
+
+  const combined = `${title}\n${goal}`.toLowerCase();
+  return /(architecture|refactor|migrate|design|complex|agent|scheduler|deployment|telegram)/.test(combined)
+    ? "extra-high"
+    : "medium";
+}
+
+function normalizeDeploymentKind(value: unknown): ManagerTurnOutput["deployments"][number]["kind"] | undefined {
+  switch (firstString(value)?.toLowerCase()) {
+    case "deploy_preview":
+    case "preview":
+    case "deploy-preview":
+      return "deploy_preview";
+    case "promote_candidate":
+    case "promote":
+    case "ship":
+    case "release":
+    case "promote-candidate":
+      return "promote_candidate";
+    case "rollback_stable":
+    case "rollback":
+    case "rollback-stable":
+      return "rollback_stable";
+    default:
+      return undefined;
+  }
+}
+
+function normalizeDecisionPriority(value: unknown): DecisionRequest["priority"] {
+  switch (firstString(value)?.toLowerCase()) {
+    case "critical":
+      return "critical";
+    case "high":
+      return "high";
+    case "low":
+      return "low";
+    case "medium":
+    default:
+      return "medium";
+  }
+}
+
+function inferNeedsPreview(kind: TaskContract["kind"], title: string, goal: string, checks: string[]): boolean {
+  if (checks.some((check) => /(serve|preview|smoke|browser|playwright|cypress|dev|start)/i.test(check))) {
+    return true;
+  }
+
+  if (kind !== "code") {
+    return false;
+  }
+
+  return /(ui|ux|frontend|web|page|browser|app|calculator)/i.test(`${title}\n${goal}`);
+}
+
+function defaultAcceptanceCriteria(kind: TaskContract["kind"], goal: string): string[] {
+  if (kind === "test") {
+    return ["The target behavior is covered by a reproducible automated or scripted test."];
+  }
+
+  if (kind === "maintenance") {
+    return ["The maintenance goal is complete and the repo remains operable."];
+  }
+
+  return [goal.length > 0 ? goal : "The task goal is complete and relevant checks pass."];
+}
+
+export function normalizeManagerTurnOutput(
+  raw: unknown,
+  options: NormalizeManagerTurnOutputOptions
+): ManagerTurnOutput {
+  const object = asRecord(raw);
+  if (!object) {
+    throw new Error("Manager output must be a JSON object");
+  }
+
+  const createId = options.createId ?? randomId;
+  const now = options.now ?? nowIso();
+  const userMessages = Array.isArray(object.userMessages)
+    ? object.userMessages
+        .map((entry) => {
+          if (typeof entry === "string") {
+            return {
+              kind: "info_update" as const,
+              text: entry
+            };
+          }
+
+          const message = asRecord(entry);
+          if (!message) {
+            return undefined;
+          }
+
+          const text = firstString(message.text, message.message, message.content, message.summary);
+          if (!text) {
+            return undefined;
+          }
+
+          return {
+            kind: normalizeTelegramKind(message.kind ?? message.type),
+            text,
+            ...(firstString(message.replyToMessageId, message.reply_to_message_id, message.replyTo)
+              ? { replyToMessageId: firstString(message.replyToMessageId, message.reply_to_message_id, message.replyTo) }
+              : {}),
+            ...(firstString(message.decisionId, message.decision_id)
+              ? { decisionId: firstString(message.decisionId, message.decision_id) }
+              : {})
+          };
+        })
+        .filter((entry): entry is ManagerTurnOutput["userMessages"][number] => Boolean(entry))
+    : [];
+
+  const tasksToStart = Array.isArray(object.tasksToStart)
+    ? object.tasksToStart
+        .map((entry) => {
+          const task = asRecord(entry);
+          if (!task) {
+            return undefined;
+          }
+
+          const title = firstString(task.title, task.summary, task.name, task.task) ?? "Untitled task";
+          const goal = firstString(task.goal, task.description, task.objective, title) ?? title;
+          const id = firstString(task.id) ?? createId("task");
+          const kind = normalizeTaskKind(task.kind ?? task.type);
+          const runtime = asRecord(task.runtime);
+          const constraints = asRecord(task.constraints);
+          const context = asRecord(task.context);
+          const ports = asRecord(task.ports);
+          const mustRunChecks = stringArray(
+            constraints?.mustRunChecks ?? task.mustRunChecks ?? task.checks
+          );
+          const files = stringArray(constraints?.files ?? task.files);
+          const doNotTouch = stringArray(constraints?.doNotTouch ?? task.doNotTouch);
+          const acceptanceCriteria = stringArray(
+            task.acceptanceCriteria ?? task.acceptance ?? task.criteria ?? task.doneWhen
+          );
+          const branchName =
+            firstString(task.branchName, task.branch, task.branch_name) ?? `agent/${slugify(title || id)}`;
+
+          return {
+            id,
+            kind,
+            title,
+            goal,
+            acceptanceCriteria:
+              acceptanceCriteria.length > 0 ? acceptanceCriteria : defaultAcceptanceCriteria(kind, goal),
+            baseBranch: firstString(task.baseBranch, task.base, task.base_branch) ?? options.candidateBranch,
+            branchName,
+            worktreePath:
+              firstString(task.worktreePath, task.worktree, task.worktree_path) ??
+              path.join(options.worktreesDir, id),
+            lockScope: (() => {
+              const explicit = stringArray(task.lockScope);
+              if (explicit.length > 0) {
+                return explicit;
+              }
+              if (files.length > 0) {
+                return files;
+              }
+              return ["repo"];
+            })(),
+            needsPreview:
+              booleanValue(task.needsPreview) ?? inferNeedsPreview(kind, title, goal, mustRunChecks),
+            ports: {
+              ...(numberValue(ports?.app ?? task.appPort) !== undefined
+                ? { app: numberValue(ports?.app ?? task.appPort) }
+                : {}),
+              ...(numberValue(ports?.e2e ?? task.e2ePort) !== undefined
+                ? { e2e: numberValue(ports?.e2e ?? task.e2ePort) }
+                : {})
+            },
+            runtime: {
+              maxRuntimeMinutes:
+                numberValue(runtime?.maxRuntimeMinutes ?? task.maxRuntimeMinutes) ??
+                (kind === "test" ? 25 : kind === "maintenance" ? 20 : 45),
+              reasoningEffort: normalizeReasoningEffort(
+                runtime?.reasoningEffort ?? task.reasoningEffort,
+                title,
+                goal
+              )
+            },
+            constraints: {
+              ...(files.length > 0 ? { files } : {}),
+              ...(doNotTouch.length > 0 ? { doNotTouch } : {}),
+              mustRunChecks
+            },
+            context: {
+              userIntent: firstString(context?.userIntent, task.userIntent, goal) ?? goal,
+              relatedTaskIds: stringArray(
+                context?.relatedTaskIds ?? task.relatedTaskIds ?? task.relatedTasks ?? task.dependsOn
+              ),
+              blockingDecisions: stringArray(context?.blockingDecisions ?? task.blockingDecisions)
+            }
+          } satisfies TaskContract;
+        })
+        .filter((entry): entry is TaskContract => Boolean(entry))
+    : [];
+
+  const tasksToCancel = Array.isArray(object.tasksToCancel)
+    ? object.tasksToCancel
+        .map((entry) => (typeof entry === "string" ? entry : firstString(asRecord(entry)?.id)))
+        .filter((entry): entry is string => Boolean(entry))
+    : [];
+
+  const reviewsToStart = Array.isArray(object.reviewsToStart)
+    ? object.reviewsToStart
+        .map((entry) => {
+          const review = asRecord(entry);
+          if (!review) {
+            return undefined;
+          }
+
+          const taskId = firstString(review.taskId, review.task_id);
+          const branch = firstString(review.branch, review.branchName);
+          const baseBranch = firstString(review.baseBranch, review.base_branch) ?? options.candidateBranch;
+          const reason = firstString(review.reason, review.summary, review.goal);
+          if (!taskId || !branch || !reason) {
+            return undefined;
+          }
+
+          return {
+            taskId,
+            branch,
+            baseBranch,
+            reason
+          };
+        })
+        .filter((entry): entry is ManagerTurnOutput["reviewsToStart"][number] => Boolean(entry))
+    : [];
+
+  const deployments = Array.isArray(object.deployments)
+    ? object.deployments
+        .map((entry) => {
+          const deployment = typeof entry === "string" ? { kind: entry } : asRecord(entry);
+          if (!deployment) {
+            return undefined;
+          }
+
+          const kind = normalizeDeploymentKind(deployment.kind ?? deployment.action ?? deployment.type);
+          if (!kind) {
+            return undefined;
+          }
+
+          return {
+            kind,
+            reason:
+              firstString(deployment.reason, deployment.summary, deployment.title) ??
+              `Manager requested ${kind}.`,
+            ...(firstString(deployment.commit, deployment.sha) ? { commit: firstString(deployment.commit, deployment.sha) } : {}),
+            ...(firstString(deployment.rollbackTag, deployment.tag)
+              ? { rollbackTag: firstString(deployment.rollbackTag, deployment.tag) }
+              : {})
+          };
+        })
+        .filter((entry): entry is ManagerTurnOutput["deployments"][number] => Boolean(entry))
+    : [];
+
+  const decisions = Array.isArray(object.decisions)
+    ? object.decisions
+        .map((entry) => {
+          const decision = asRecord(entry);
+          if (!decision) {
+            return undefined;
+          }
+
+          const title = firstString(decision.title, decision.question);
+          if (!title) {
+            return undefined;
+          }
+
+          const options = Array.isArray(decision.options)
+            ? decision.options
+                .map((option, index) => {
+                  if (typeof option === "string") {
+                    return {
+                      id: `option_${index + 1}`,
+                      label: option,
+                      consequence: option
+                    };
+                  }
+
+                  const item = asRecord(option);
+                  const label = firstString(item?.label, item?.title, item?.text);
+                  if (!item || !label) {
+                    return undefined;
+                  }
+
+                  return {
+                    id: firstString(item.id) ?? `option_${index + 1}`,
+                    label,
+                    consequence: firstString(item.consequence, item.summary, label) ?? label
+                  };
+                })
+                .filter((option): option is DecisionRequest["options"][number] => Boolean(option))
+            : [];
+
+          if (options.length < 2) {
+            return undefined;
+          }
+
+          const firstOption = options[0];
+          if (!firstOption) {
+            return undefined;
+          }
+
+          const defaultOptionId =
+            firstString(decision.defaultOptionId, decision.defaultOption, decision.default) ?? firstOption.id;
+
+          return {
+            id: firstString(decision.id) ?? createId("decision"),
+            title,
+            reason: firstString(decision.reason, decision.context, decision.why, title) ?? title,
+            priority: normalizeDecisionPriority(decision.priority),
+            dedupeKey:
+              firstString(decision.dedupeKey) ??
+              computeDecisionDedupeKey(title, options.map((option) => option.label), title),
+            options,
+            defaultOptionId: options.some((option) => option.id === defaultOptionId)
+              ? defaultOptionId
+              : firstOption.id,
+            expiresAt:
+              firstString(decision.expiresAt) ??
+              new Date(Date.parse(now) + 4 * 60 * 60 * 1000).toISOString(),
+            impactSummary:
+              firstString(decision.impactSummary, decision.impact, decision.reason, title) ?? title,
+            budgetCost: 1 as const
+          } satisfies DecisionRequest;
+        })
+        .filter((entry): entry is DecisionRequest => Boolean(entry))
+    : [];
+
+  const assumptions = stringArray(object.assumptions);
+
+  return {
+    summary: firstString(object.summary, object.message, object.title) ?? "Manager turn update",
+    userMessages,
+    tasksToStart,
+    tasksToCancel,
+    reviewsToStart,
+    deployments,
+    decisions,
+    assumptions
+  };
 }
 
 export function sha256(value: string): string {

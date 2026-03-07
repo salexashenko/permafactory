@@ -4,7 +4,11 @@ import path from "node:path";
 import {
   allocatePorts,
   computeDecisionBudgetSnapshot,
+  formatHttpUrl,
+  normalizeManagerTurnOutput,
   parseTopLevelBacklogItems,
+  selectReachableHost,
+  shouldDeliverTelegramNotification,
   validateWithSchema
 } from "@permafactory/runtime";
 import type { FactoryProjectConfig, ManagerTurnOutput, TaskContract } from "@permafactory/models";
@@ -112,6 +116,47 @@ test("allocatePorts can allocate app-only leases", () => {
   assert.deepEqual(ports, { app: 3202 });
 });
 
+test("selectReachableHost prefers Tailscale DNS and falls back to LAN IP", () => {
+  assert.deepEqual(
+    selectReachableHost({
+      tailscaleDnsName: "bigboy.tail685bf8.ts.net.",
+      tailscaleIp: "100.90.88.58",
+      lanIp: "192.168.1.10"
+    }),
+    {
+      host: "bigboy.tail685bf8.ts.net",
+      source: "tailscale-dns"
+    }
+  );
+
+  assert.deepEqual(
+    selectReachableHost({
+      lanIp: "192.168.1.10"
+    }),
+    {
+      host: "192.168.1.10",
+      source: "lan-ip"
+    }
+  );
+});
+
+test("formatHttpUrl brackets IPv6 hosts", () => {
+  assert.equal(formatHttpUrl("100.90.88.58", 3100), "http://100.90.88.58:3100");
+  assert.equal(formatHttpUrl("fd7a:115c:a1e0::ea01:583a", 3100), "http://[fd7a:115c:a1e0::ea01:583a]:3100");
+});
+
+test("shouldDeliverTelegramNotification only allows direct replies, decisions, ships, and digests", () => {
+  assert.equal(shouldDeliverTelegramNotification("decision_required"), true);
+  assert.equal(shouldDeliverTelegramNotification("ship_result"), true);
+  assert.equal(shouldDeliverTelegramNotification("daily_digest"), true);
+  assert.equal(shouldDeliverTelegramNotification("info_update"), false);
+  assert.equal(
+    shouldDeliverTelegramNotification("info_update", { isDirectUserResponse: true }),
+    true
+  );
+  assert.equal(shouldDeliverTelegramNotification("incident_alert"), false);
+});
+
 test("manager output schema accepts a minimal valid payload", async () => {
   const schemaPath = path.resolve("schemas/manager-output.schema.json");
   const output: ManagerTurnOutput = {
@@ -144,4 +189,40 @@ test("manager output schema rejects malformed tasks", async () => {
 
   const result = await validateWithSchema<ManagerTurnOutput>(schemaPath, malformed);
   assert.equal(result.valid, false);
+});
+
+test("normalizeManagerTurnOutput materializes planner-friendly manager output", async () => {
+  const schemaPath = path.resolve("schemas/manager-output.schema.json");
+  const normalized = normalizeManagerTurnOutput(
+    {
+      summary: "Bootstrap the repo",
+      userMessages: [{ kind: "reply", message: "I am baselining the calculator app." }],
+      tasksToStart: [
+        {
+          kind: "feature",
+          title: "Baseline the calculator app",
+          goal: "Verify build, test, and preview workflows for the calculator web app.",
+          acceptance: ["Build passes", "Tests pass"],
+          checks: ["npm run build", "npm test", "npm run smoke"]
+        }
+      ],
+      deployments: [{ action: "preview", summary: "Refresh preview after baseline checks." }],
+      assumptions: ["Use candidate as the default base branch."]
+    },
+    {
+      candidateBranch: "candidate",
+      worktreesDir: "/tmp/demo/.factory/worktrees",
+      now: "2026-03-07T00:00:00.000Z",
+      createId: (prefix) => `${prefix}_fixed`
+    }
+  );
+
+  assert.equal(normalized.userMessages[0]?.kind, "info_update");
+  assert.equal(normalized.tasksToStart[0]?.id, "task_fixed");
+  assert.equal(normalized.tasksToStart[0]?.branchName, "agent/baseline-the-calculator-app");
+  assert.equal(normalized.tasksToStart[0]?.worktreePath, "/tmp/demo/.factory/worktrees/task_fixed");
+  assert.equal(normalized.deployments[0]?.kind, "deploy_preview");
+
+  const result = await validateWithSchema<ManagerTurnOutput>(schemaPath, normalized);
+  assert.equal(result.valid, true);
 });

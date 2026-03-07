@@ -5,6 +5,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { open } from "node:fs/promises";
 import process from "node:process";
 import type { Duplex } from "node:stream";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { FactoryDatabase } from "@permafactory/db";
 import { loadProjectConfig } from "@permafactory/config";
@@ -25,17 +26,21 @@ import {
   derivePortLeaseRequirement,
   ensureDetachedWorktreeAtRef,
   ensureDir,
+  fileExists,
   getFactoryPaths,
   isPlaceholderScript,
   listDirtyFiles,
   loadEnvFile,
   localDateString,
+  normalizeManagerTurnOutput,
   nowIso,
   randomId,
   readText,
+  resolveReachableHttpUrl,
   runCommand,
   sampleResources,
   sendTelegramApiRequest,
+  shouldDeliverTelegramNotification,
   slugify,
   spawnLoggedShellCommand,
   spawnLoggedProcess,
@@ -145,6 +150,8 @@ class AppServerClient {
     });
 
     this.socket.addEventListener("close", () => {
+      this.initialized = false;
+      this.socket = undefined;
       for (const [id, pending] of this.pending.entries()) {
         this.pending.delete(id);
         pending.reject(new Error("App server socket closed"));
@@ -163,6 +170,16 @@ class AppServerClient {
       capabilities: null
     });
     this.initialized = true;
+  }
+
+  dispose(): void {
+    this.initialized = false;
+    try {
+      this.socket?.close();
+    } catch {
+      // Ignore close errors during transport reset.
+    }
+    this.socket = undefined;
   }
 
   onNotification(listener: (message: JsonRpcResponse) => void): () => void {
@@ -303,6 +320,7 @@ class AppServerClient {
 
 class FactorySupervisor {
   private readonly paths: ReturnType<typeof getFactoryPaths>;
+  private readonly factoryRepoRoot: string;
   private readonly managerSchemaPath: string;
   private readonly workerSchemaPath: string;
   private readonly reviewerSchemaPath: string;
@@ -324,14 +342,15 @@ class FactorySupervisor {
 
   constructor(private config: FactoryProjectConfig, private readonly db: FactoryDatabase) {
     this.paths = getFactoryPaths(this.config.repoRoot);
-    this.managerSchemaPath = path.resolve(this.config.repoRoot, "schemas/manager-output.schema.json");
-    this.workerSchemaPath = path.resolve(this.config.repoRoot, "schemas/worker-result.schema.json");
-    this.reviewerSchemaPath = path.resolve(this.config.repoRoot, "schemas/reviewer-result.schema.json");
-    this.testerSchemaPath = path.resolve(this.config.repoRoot, "schemas/tester-result.schema.json");
-    this.managerPromptPath = path.resolve(this.config.repoRoot, "prompts/manager.md");
-    this.workerPromptPath = path.resolve(this.config.repoRoot, "prompts/worker.md");
-    this.reviewerPromptPath = path.resolve(this.config.repoRoot, "prompts/reviewer.md");
-    this.testerPromptPath = path.resolve(this.config.repoRoot, "prompts/tester.md");
+    this.factoryRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+    this.managerSchemaPath = path.resolve(this.factoryRepoRoot, "schemas/manager-output.schema.json");
+    this.workerSchemaPath = path.resolve(this.factoryRepoRoot, "schemas/worker-result.schema.json");
+    this.reviewerSchemaPath = path.resolve(this.factoryRepoRoot, "schemas/reviewer-result.schema.json");
+    this.testerSchemaPath = path.resolve(this.factoryRepoRoot, "schemas/tester-result.schema.json");
+    this.managerPromptPath = path.resolve(this.factoryRepoRoot, "prompts/manager.md");
+    this.workerPromptPath = path.resolve(this.factoryRepoRoot, "prompts/worker.md");
+    this.reviewerPromptPath = path.resolve(this.factoryRepoRoot, "prompts/reviewer.md");
+    this.testerPromptPath = path.resolve(this.factoryRepoRoot, "prompts/tester.md");
   }
 
   async run(once: boolean): Promise<void> {
@@ -453,12 +472,16 @@ class FactorySupervisor {
       }
 
       const parsed = JSON.parse(result.outputText) as unknown;
-      const validated = await validateWithSchema<ManagerTurnOutput>(this.managerSchemaPath, parsed);
+      const normalized = normalizeManagerTurnOutput(parsed, {
+        candidateBranch: this.config.candidateBranch,
+        worktreesDir: this.paths.worktreesDir
+      });
+      const validated = await validateWithSchema<ManagerTurnOutput>(this.managerSchemaPath, normalized);
       if (!validated.valid) {
         throw new Error(`Manager output validation failed: ${validated.errors.join("; ")}`);
       }
 
-      await this.applyManagerOutput(validated.value, wakeReasons);
+      await this.applyManagerOutput(validated.value, wakeReasons, input.userMessages.length > 0);
       for (const inboxItem of this.db.listInboxItems(this.config.projectId, ["new"])) {
         this.db.markInboxItemStatus(inboxItem.id, "triaged");
       }
@@ -484,11 +507,13 @@ class FactorySupervisor {
         return;
       }
 
+      const restartPlanned = await this.recoverManagerFailure(error);
+
       this.db.upsertAgent({
         id: "manager",
         projectId: this.config.projectId,
         role: "manager",
-        status: "failed",
+        status: restartPlanned ? "idle" : "failed",
         threadId: this.activeManagerThreadId
       });
       console.error(`manager turn failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -497,6 +522,29 @@ class FactorySupervisor {
       this.activeManagerTurnId = undefined;
       this.managerRunning = false;
     }
+  }
+
+  private async recoverManagerFailure(error: unknown): Promise<boolean> {
+    const message = error instanceof Error ? error.message : String(error);
+    const shouldInterruptTurn = /Timed out waiting for turn/i.test(message);
+    const shouldResetTransport = /Timed out waiting for turn|Not initialized|socket closed|Failed connecting/i.test(
+      message
+    );
+
+    if (shouldInterruptTurn && this.activeManagerThreadId && this.activeManagerTurnId) {
+      try {
+        await this.getAppServerClient().interruptTurn(this.activeManagerThreadId, this.activeManagerTurnId);
+      } catch {
+        // Ignore best-effort interrupt failures during recovery.
+      }
+    }
+
+    if (shouldResetTransport) {
+      await this.resetManagerTransport();
+      return true;
+    }
+
+    return false;
   }
 
   private async buildManagerInstructions(): Promise<string> {
@@ -519,7 +567,8 @@ class FactorySupervisor {
 
   private async applyManagerOutput(
     output: ManagerTurnOutput,
-    wakeReasons: string[]
+    wakeReasons: string[],
+    hasDirectUserMessage: boolean
   ): Promise<void> {
     console.log(`[manager] ${output.summary}`);
     if (wakeReasons.length > 0) {
@@ -530,8 +579,21 @@ class FactorySupervisor {
       await this.maybeCreateDecision(decision);
     }
 
+    let directResponseSent = false;
     for (const message of output.userMessages) {
-      await this.sendTelegramMessage(message.kind, message.text, message.replyToMessageId, message.decisionId);
+      const isDirectUserResponse =
+        hasDirectUserMessage && message.kind === "info_update" && !directResponseSent;
+      const delivered = await this.sendTelegramMessage(
+        message.kind,
+        message.text,
+        message.replyToMessageId,
+        message.decisionId,
+        undefined,
+        { isDirectUserResponse }
+      );
+      if (delivered && message.kind === "info_update") {
+        directResponseSent = true;
+      }
     }
 
     for (const taskId of output.tasksToCancel) {
@@ -544,15 +606,23 @@ class FactorySupervisor {
 
     for (const review of output.reviewsToStart) {
       const task = this.db.getTask(review.taskId);
-      if (!task?.contract) {
+      if (!task?.contract || task.status !== "review") {
+        continue;
+      }
+      if (
+        this.db
+          .listAgents(this.config.projectId)
+          .some((agent) => agent.role === "review" && agent.taskId === review.taskId && agent.status === "running")
+      ) {
         continue;
       }
       const reviewTask: TaskContract = {
         ...task.contract,
-        id: randomId("review"),
-        kind: "test",
+        id: task.id,
         title: `Review ${task.title}`,
         goal: review.reason,
+        needsPreview: false,
+        ports: {},
         runtime: { maxRuntimeMinutes: 30, reasoningEffort: "medium" },
         constraints: {
           ...task.contract.constraints,
@@ -617,8 +687,14 @@ class FactorySupervisor {
     text: string,
     replyToMessageId?: string,
     decisionId?: string,
-    inlineKeyboard?: Array<Array<{ text: string; callback_data: string }>>
-  ): Promise<void> {
+    inlineKeyboard?: Array<Array<{ text: string; callback_data: string }>>,
+    options: { isDirectUserResponse?: boolean } = {}
+  ): Promise<boolean> {
+    if (!shouldDeliverTelegramNotification(kind, options)) {
+      console.log(`[telegram:suppressed:${kind}] ${text}`);
+      return false;
+    }
+
     const messageId = randomId("telegram");
     const chatId = this.config.telegram.controlChatId;
     const botToken = process.env[this.config.telegram.botTokenEnvVar];
@@ -636,7 +712,7 @@ class FactorySupervisor {
 
     if (!chatId || !botToken) {
       console.log(`[telegram:${kind}] ${text}`);
-      return;
+      return true;
     }
 
     try {
@@ -646,8 +722,10 @@ class FactorySupervisor {
         reply_to_message_id: replyToMessageId ? Number.parseInt(replyToMessageId, 10) : undefined,
         reply_markup: inlineKeyboard ? { inline_keyboard: inlineKeyboard } : undefined
       });
+      return true;
     } catch (error) {
       console.error(`telegram send failed: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
     }
   }
 
@@ -749,7 +827,13 @@ class FactorySupervisor {
     const worktreePath = contract.worktreePath;
     const branchName = contract.branchName;
     const baseBranch = contract.baseBranch || this.config.candidateBranch;
-    const requirement = derivePortLeaseRequirement(contract);
+    const reusesExistingWorktree =
+      role === "review" &&
+      this.db.getTask(contract.id)?.worktreePath === worktreePath &&
+      (await fileExists(path.join(worktreePath, ".git")));
+    const requirement = reusesExistingWorktree
+      ? { app: false, e2e: false }
+      : derivePortLeaseRequirement(contract);
     const usedPorts = new Set(this.db.listActivePortLeases(this.config.projectId).map((lease) => lease.port));
     const allocatedPorts = allocatePorts(this.config, usedPorts, {
       app: requirement.app && contract.ports.app === undefined,
@@ -764,58 +848,61 @@ class FactorySupervisor {
         ...(allocatedPorts.e2e !== undefined ? { e2e: allocatedPorts.e2e } : {})
       }
     };
-    await ensureDir(path.dirname(worktreePath));
-    await addWorktree(this.config.repoRoot, worktreePath, branchName, baseBranch);
-    const baseCommit = await currentCommit(this.config.repoRoot, baseBranch);
+    if (!reusesExistingWorktree) {
+      await ensureDir(path.dirname(worktreePath));
+      await addWorktree(this.config.repoRoot, worktreePath, branchName, baseBranch);
+      const baseCommit = await currentCommit(this.config.repoRoot, baseBranch);
 
-    this.db.insertWorktree({
-      id: worktreeId,
-      projectId: this.config.projectId,
-      taskId: normalized.id,
-      worktreePath,
-      branchName,
-      baseBranch,
-      baseCommit,
-      appPort: normalized.ports.app,
-      e2ePort: normalized.ports.e2e
-    });
-    if (normalized.ports.app !== undefined) {
-      this.db.addPortLease(this.config.projectId, worktreeId, "app", normalized.ports.app);
+      this.db.insertWorktree({
+        id: worktreeId,
+        projectId: this.config.projectId,
+        taskId: normalized.id,
+        worktreePath,
+        branchName,
+        baseBranch,
+        baseCommit,
+        appPort: normalized.ports.app,
+        e2ePort: normalized.ports.e2e
+      });
+      if (normalized.ports.app !== undefined) {
+        this.db.addPortLease(this.config.projectId, worktreeId, "app", normalized.ports.app);
+      }
+      if (normalized.ports.e2e !== undefined) {
+        this.db.addPortLease(this.config.projectId, worktreeId, "e2e", normalized.ports.e2e);
+      }
+
+      const envFilePath = path.join(worktreePath, ".factory.env");
+      const envText = [
+        `FACTORY_TASK_ID=${normalized.id}`,
+        `FACTORY_BRANCH=${branchName}`,
+        normalized.ports.app !== undefined ? `PORT=${normalized.ports.app}` : undefined,
+        normalized.ports.app !== undefined ? `FACTORY_APP_PORT=${normalized.ports.app}` : undefined,
+        normalized.ports.e2e !== undefined ? `FACTORY_E2E_PORT=${normalized.ports.e2e}` : undefined
+      ]
+        .filter((line): line is string => Boolean(line))
+        .join("\n");
+      await writeText(envFilePath, `${envText}\n`);
+
+      await runCommand("bash", [path.resolve(this.config.repoRoot, this.config.scripts.bootstrapWorktree), worktreePath], {
+        cwd: this.config.repoRoot,
+        env: {
+          FACTORY_TASK_ID: normalized.id,
+          FACTORY_BRANCH: branchName,
+          ...(normalized.ports.app !== undefined
+            ? { PORT: String(normalized.ports.app), FACTORY_APP_PORT: String(normalized.ports.app) }
+            : {}),
+          ...(normalized.ports.e2e !== undefined
+            ? { FACTORY_E2E_PORT: String(normalized.ports.e2e) }
+            : {})
+        },
+        allowNonZeroExit: true
+      });
     }
-    if (normalized.ports.e2e !== undefined) {
-      this.db.addPortLease(this.config.projectId, worktreeId, "e2e", normalized.ports.e2e);
-    }
-
-    const envFilePath = path.join(worktreePath, ".factory.env");
-    const envText = [
-      `FACTORY_TASK_ID=${normalized.id}`,
-      `FACTORY_BRANCH=${branchName}`,
-      normalized.ports.app !== undefined ? `PORT=${normalized.ports.app}` : undefined,
-      normalized.ports.app !== undefined ? `FACTORY_APP_PORT=${normalized.ports.app}` : undefined,
-      normalized.ports.e2e !== undefined ? `FACTORY_E2E_PORT=${normalized.ports.e2e}` : undefined
-    ]
-      .filter((line): line is string => Boolean(line))
-      .join("\n");
-    await writeText(envFilePath, `${envText}\n`);
-
-    await runCommand("bash", [path.resolve(this.config.repoRoot, this.config.scripts.bootstrapWorktree), worktreePath], {
-      cwd: this.config.repoRoot,
-      env: {
-        FACTORY_TASK_ID: normalized.id,
-        FACTORY_BRANCH: branchName,
-        ...(normalized.ports.app !== undefined
-          ? { PORT: String(normalized.ports.app), FACTORY_APP_PORT: String(normalized.ports.app) }
-          : {}),
-        ...(normalized.ports.e2e !== undefined
-          ? { FACTORY_E2E_PORT: String(normalized.ports.e2e) }
-          : {})
-      },
-      allowNonZeroExit: true
-    });
 
     const runId = randomId("run");
     const runDir = path.join(this.paths.runsDir, runId);
     await ensureDir(runDir);
+    const codexHome = process.env.CODEX_HOME;
     const jsonlLogPath = path.join(runDir, "events.jsonl");
     const finalMessagePath = path.join(runDir, "final.json");
     const stdoutFd = await open(jsonlLogPath, "a");
@@ -833,28 +920,19 @@ class FactorySupervisor {
       [
         "exec",
         "--json",
-        "-C",
+        "--cd",
         worktreePath,
-        "-m",
+        "--model",
         this.config.codex.model,
-        "-s",
+        "--sandbox",
         this.config.codex.sandboxMode,
-        "-c",
-        'approval_policy="never"',
-        "-c",
-        `model_reasoning_effort="${mapReasoningEffort(contract.runtime.reasoningEffort)}"`,
-        "--output-schema",
-        schemaPath,
-        "--output-last-message",
-        finalMessagePath,
-        ...(this.config.codex.searchEnabled ? ["--search"] : []),
         "-"
       ],
       {
         cwd: this.config.repoRoot,
         env: {
           ...process.env,
-          CODEX_HOME: process.env.CODEX_HOME ?? path.join(this.config.repoRoot, ".codex-home"),
+          ...(codexHome ? { CODEX_HOME: codexHome } : {}),
           FACTORY_TASK_ID: normalized.id,
           FACTORY_BRANCH: branchName,
           ...(normalized.ports.app !== undefined
@@ -896,12 +974,17 @@ class FactorySupervisor {
       worktreePath,
       pid: child.pid
     });
-    this.db.updateTaskStatus(normalized.id, "running");
+    if (role !== "review") {
+      this.db.updateTaskStatus(normalized.id, "running");
+    }
     this.db.insertTaskEvent(normalized.id, "started", `Started ${role} worker`);
 
     child.on("exit", async () => {
       try {
-        await this.handleWorkerExit(normalized, role, runId, finalMessagePath);
+        await this.handleWorkerExit(normalized, role, runId, {
+          finalMessagePath,
+          jsonlLogPath
+        });
       } catch (error) {
         console.error(`worker exit handling failed: ${error instanceof Error ? error.message : String(error)}`);
       } finally {
@@ -914,7 +997,7 @@ class FactorySupervisor {
     contract: TaskContract,
     role: "code" | "review" | "test",
     runId: string,
-    finalMessagePath: string
+    outputPaths: { finalMessagePath: string; jsonlLogPath: string }
   ): Promise<void> {
     const schemaPath =
       role === "review"
@@ -922,7 +1005,10 @@ class FactorySupervisor {
         : role === "test"
           ? this.testerSchemaPath
           : this.workerSchemaPath;
-    const raw = await readText(finalMessagePath).catch(() => "{}");
+    const raw =
+      (await readText(outputPaths.finalMessagePath).catch(() => undefined)) ??
+      (await this.readLastAgentMessageFromJsonl(outputPaths.jsonlLogPath)) ??
+      "{}";
     const parsed = JSON.parse(raw) as unknown;
     const validated =
       role === "review"
@@ -969,13 +1055,55 @@ class FactorySupervisor {
       const nextStatus = result.status === "completed" ? (result.needsReview ? "review" : "done") : result.status;
       this.db.updateTaskStatus(contract.id, nextStatus as never);
       this.db.insertTaskEvent(contract.id, result.status, result.summary, result);
+    } else if (role === "review") {
+      const result = validated.value as ReviewerResult;
+      const nextStatus =
+        result.status !== "completed"
+          ? result.status
+          : result.recommendedAction === "merge"
+            ? "done"
+            : "failed";
+      this.db.updateTaskStatus(contract.id, nextStatus as never);
+      this.db.insertTaskEvent(contract.id, result.status, result.summary, result);
     } else {
-      const result = validated.value as ReviewerResult | TesterResult;
+      const result = validated.value as TesterResult;
       this.db.updateTaskStatus(contract.id, result.status === "completed" ? "done" : (result.status as never));
       this.db.insertTaskEvent(contract.id, result.status, result.summary, result);
     }
 
     this.pendingManagerWakeReasons.add("worker_terminal");
+  }
+
+  private async readLastAgentMessageFromJsonl(jsonlLogPath: string): Promise<string | undefined> {
+    const raw = await readText(jsonlLogPath).catch(() => undefined);
+    if (!raw) {
+      return undefined;
+    }
+
+    const lines = raw
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const line = lines[index];
+      if (!line) {
+        continue;
+      }
+
+      try {
+        const event = JSON.parse(line) as {
+          type?: string;
+          item?: { type?: string; text?: string };
+        };
+        if (event.type === "item.completed" && event.item?.type === "agent_message" && event.item.text) {
+          return event.item.text;
+        }
+      } catch {
+        // Ignore non-JSON log lines emitted alongside JSONL events.
+      }
+    }
+
+    return undefined;
   }
 
   private async handleDeploymentIntent(
@@ -999,6 +1127,8 @@ class FactorySupervisor {
 
   private async reconcileRuntimeTargets(): Promise<void> {
     const snapshot = this.db.getDeploymentSnapshot(this.config.projectId);
+    const stableUrl = await this.resolveStableUrl();
+    const previewUrl = await this.resolvePreviewUrl();
     if (snapshot.stable.commit) {
       await this.ensureStableProxyServer();
       const activeSlot = snapshot.stable.activeSlot;
@@ -1010,7 +1140,7 @@ class FactorySupervisor {
             projectId: this.config.projectId,
             target: "stable",
             status: "down",
-            url: `http://127.0.0.1:${this.config.ports.stableProxy}`,
+            url: stableUrl,
             commit: snapshot.stable.commit,
             activeSlot,
             reason: "stable serve script not configured"
@@ -1021,7 +1151,7 @@ class FactorySupervisor {
           projectId: this.config.projectId,
           target: "stable",
           status: "down",
-          url: `http://127.0.0.1:${this.config.ports.stableProxy}`,
+          url: stableUrl,
           commit: snapshot.stable.commit,
           activeSlot,
           reason: "stable slot failed healthcheck"
@@ -1039,7 +1169,7 @@ class FactorySupervisor {
             projectId: this.config.projectId,
             target: "preview",
             status: "down",
-            url: `http://127.0.0.1:${this.config.ports.preview}`,
+            url: previewUrl,
             commit: snapshot.preview.commit,
             reason: "preview serve script not configured"
           });
@@ -1056,7 +1186,7 @@ class FactorySupervisor {
           projectId: this.config.projectId,
           target: "preview",
           status: "down",
-          url: `http://127.0.0.1:${this.config.ports.preview}`,
+          url: previewUrl,
           commit: snapshot.preview.commit,
           reason: "preview slot failed healthcheck"
         });
@@ -1078,11 +1208,12 @@ class FactorySupervisor {
       this.config.ports.stableA
     );
     await this.ensureStableProxyServer();
+    const stableUrl = await this.resolveStableUrl();
     this.db.recordDeployment({
       projectId: this.config.projectId,
       target: "stable",
       status: success ? "healthy" : "down",
-      url: `http://127.0.0.1:${this.config.ports.stableProxy}`,
+      url: stableUrl,
       commit,
       activeSlot: "stable-a",
       reason: success ? "bootstrap stable runtime" : "bootstrap stable runtime failed"
@@ -1101,19 +1232,20 @@ class FactorySupervisor {
       script,
       this.config.ports.preview
     );
+    const previewUrl = await this.resolvePreviewUrl();
     this.db.recordDeployment({
       projectId: this.config.projectId,
       target: "preview",
       status: success ? "healthy" : "down",
-      url: `http://127.0.0.1:${this.config.ports.preview}`,
+      url: previewUrl,
       commit,
       reason
     });
     await this.sendTelegramMessage(
       success ? "info_update" : "incident_alert",
       success
-        ? `Preview updated to ${commit.slice(0, 12)}. ${reason}`
-        : `Preview deployment failed for ${commit.slice(0, 12)}. ${reason}`
+        ? `Preview updated: ${previewUrl}\nCommit: ${commit.slice(0, 12)}\n${reason}`
+        : `Preview deployment failed for ${commit.slice(0, 12)}.\nExpected URL: ${previewUrl}\n${reason}`
     );
   }
 
@@ -1131,11 +1263,12 @@ class FactorySupervisor {
       serveScript,
       this.runtimeSlotPort(nextSlot)
     );
+    const stableUrl = await this.resolveStableUrl();
     this.db.recordDeployment({
       projectId: this.config.projectId,
       target: "stable",
       status: success ? "healthy" : "down",
-      url: `http://127.0.0.1:${this.config.ports.stableProxy}`,
+      url: stableUrl,
       commit,
       activeSlot: nextSlot,
       reason
@@ -1143,7 +1276,7 @@ class FactorySupervisor {
     if (!success) {
       await this.sendTelegramMessage(
         "incident_alert",
-        `Stable promotion failed for ${commit.slice(0, 12)}. ${reason}`
+        `Stable promotion failed for ${commit.slice(0, 12)}.\nExpected URL: ${stableUrl}\n${reason}`
       );
       return;
     }
@@ -1153,7 +1286,7 @@ class FactorySupervisor {
     this.db.insertReleaseTag(this.config.projectId, tag, commit);
     await this.sendTelegramMessage(
       "ship_result",
-      `Stable is live at ${commit.slice(0, 12)} on ${nextSlot}. ${reason}`
+      `Stable is live: ${stableUrl}\nCommit: ${commit.slice(0, 12)} (${nextSlot})\n${reason}`
     );
   }
 
@@ -1175,11 +1308,12 @@ class FactorySupervisor {
       serveScript,
       this.runtimeSlotPort(nextSlot)
     );
+    const stableUrl = await this.resolveStableUrl();
     this.db.recordDeployment({
       projectId: this.config.projectId,
       target: "stable",
       status: success ? "healthy" : "down",
-      url: `http://127.0.0.1:${this.config.ports.stableProxy}`,
+      url: stableUrl,
       commit,
       activeSlot: nextSlot,
       reason: rollbackTag ? `${reason} (${rollbackTag})` : reason
@@ -1187,8 +1321,8 @@ class FactorySupervisor {
     await this.sendTelegramMessage(
       success ? "ship_result" : "incident_alert",
       success
-        ? `Stable rolled back to ${commit.slice(0, 12)} on ${nextSlot}. ${reason}`
-        : `Stable rollback failed for ${commit.slice(0, 12)}. ${reason}`
+        ? `Stable rolled back: ${stableUrl}\nCommit: ${commit.slice(0, 12)} (${nextSlot})\n${reason}`
+        : `Stable rollback failed for ${commit.slice(0, 12)}.\nExpected URL: ${stableUrl}\n${reason}`
     );
   }
 
@@ -1363,6 +1497,14 @@ class FactorySupervisor {
     });
   }
 
+  private async resolveStableUrl(): Promise<string> {
+    return await resolveReachableHttpUrl(this.config.ports.stableProxy);
+  }
+
+  private async resolvePreviewUrl(): Promise<string> {
+    return await resolveReachableHttpUrl(this.config.ports.preview);
+  }
+
   private async proxyStableHttp(
     request: http.IncomingMessage,
     response: http.ServerResponse
@@ -1485,8 +1627,15 @@ class FactorySupervisor {
         : role === "test"
           ? this.testerPromptPath
           : this.workerPromptPath;
+    const schemaPath =
+      role === "review"
+        ? this.reviewerSchemaPath
+        : role === "test"
+          ? this.testerSchemaPath
+          : this.workerSchemaPath;
     const prompt = await readText(promptPath);
-    return `${prompt}\n\nTask contract:\n${JSON.stringify(contract, null, 2)}\n`;
+    const schema = await readText(schemaPath);
+    return `${prompt}\n\nReturn JSON only matching this schema:\n${schema}\n\nTask contract:\n${JSON.stringify(contract, null, 2)}\n`;
   }
 
   private async ensureAppServer(): Promise<void> {
@@ -1512,6 +1661,33 @@ class FactorySupervisor {
     }
 
     await this.getAppServerClient().connect();
+  }
+
+  private async resetManagerTransport(): Promise<void> {
+    this.appServerClient?.dispose();
+    this.appServerClient = undefined;
+
+    if (!this.appServerProcess || this.appServerProcess.exitCode !== null) {
+      this.appServerProcess = undefined;
+      return;
+    }
+
+    try {
+      this.appServerProcess.kill("SIGTERM");
+    } catch {
+      this.appServerProcess = undefined;
+      return;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    if (this.appServerProcess.exitCode === null) {
+      try {
+        this.appServerProcess.kill("SIGKILL");
+      } catch {
+        // Ignore already-dead process.
+      }
+    }
+    this.appServerProcess = undefined;
   }
 
   private getAppServerClient(): AppServerClient {

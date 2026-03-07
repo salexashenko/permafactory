@@ -113,10 +113,13 @@ function renderTelegramSetupGuide(config: FactoryProjectConfig): string {
     `1. Open Telegram and start a chat with @BotFather.`,
     "2. Send /newbot and follow the prompts for the bot name and username.",
     `3. Put the token into ${path.join(config.repoRoot, ".env.factory")} as ${config.telegram.botTokenEnvVar}=...`,
-    "4. If the control room will use normal group messages, run /setprivacy in BotFather and disable privacy mode for this bot.",
-    `5. Generate ${config.telegram.webhookSecretEnvVar}, for example: openssl rand -hex 32`,
-    `6. Add the bot to a Telegram supergroup and run: factoryctl telegram connect --repo ${config.repoRoot} --bot-token-env ${config.telegram.botTokenEnvVar}`,
-    "7. Send /hello in that supergroup to bind it.",
+    "4. Easiest path: send a direct message to the bot from your own Telegram account.",
+    "5. If you prefer a shared control room, add the bot to a supergroup instead.",
+    "6. If the bot needs to read normal supergroup messages, run /setprivacy in BotFather and disable privacy mode for this bot.",
+    `7. Generate ${config.telegram.webhookSecretEnvVar}, for example: openssl rand -hex 32`,
+    `8. Run: factoryctl telegram connect --repo ${config.repoRoot} --bot-token-env ${config.telegram.botTokenEnvVar}`,
+    "9. Send /hello to the bot in your DM or in the control supergroup to bind it.",
+    "10. You do not need to discover the chat id manually; the CLI captures it from /hello.",
     `More detail: ${path.join(config.repoRoot, config.bootstrap.onboardingSummaryPath)}`
   ].join("\n");
 }
@@ -360,12 +363,17 @@ async function handleTelegramConnect(args: string[]): Promise<void> {
         continue;
       }
 
-      if (message.chat?.type !== "supergroup") {
-        throw new Error("Telegram connect rejected a non-supergroup chat");
+      const chatType = message.chat?.type;
+      if (chatType !== "supergroup" && chatType !== "private") {
+        throw new Error("Telegram connect only accepts a private chat or a supergroup");
+      }
+      if (message.chat?.id === undefined) {
+        throw new Error("Telegram connect received /hello without a chat id");
       }
 
       const chatId = String(message.chat.id);
       config.telegram.controlChatId = chatId;
+      config.telegram.allowAdminDm = chatType === "private";
       if (message.from?.id) {
         const userId = String(message.from.id);
         if (!config.telegram.allowedAdminUserIds.includes(userId)) {
@@ -393,14 +401,14 @@ async function handleTelegramConnect(args: string[]): Promise<void> {
         });
       }
 
-      console.log(`Bound Telegram chat ${chatId}`);
+      console.log(`Bound Telegram ${chatType} chat ${chatId}`);
       bound = true;
       break;
     }
   }
 
   if (!bound) {
-    throw new Error("Timed out waiting for /hello in a private Telegram supergroup");
+    throw new Error("Timed out waiting for /hello in a Telegram DM or control supergroup");
   }
 
   db.close();
@@ -476,6 +484,7 @@ async function handleStart(args: string[]): Promise<void> {
 
   const repoRoot = path.resolve(requireString(parsed.values.repo, "--repo"));
   await loadRepoEnv(repoRoot);
+  const factoryRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const factorydEntrypoint = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
     "../../factoryd/src/main.ts"
@@ -487,7 +496,7 @@ async function handleStart(args: string[]): Promise<void> {
 
   if (parsed.values.foreground) {
     const result = await runCommand(process.execPath, commandArgs, {
-      cwd: path.resolve(repoRoot, ".."),
+      cwd: factoryRepoRoot,
       allowNonZeroExit: true
     });
     process.stdout.write(result.stdout);
@@ -502,7 +511,7 @@ async function handleStart(args: string[]): Promise<void> {
   const spawned = await spawnLoggedProcess({
     command: process.execPath,
     args: commandArgs,
-    cwd: path.resolve(repoRoot, ".."),
+    cwd: factoryRepoRoot,
     stdoutPath: path.join(paths.logsDir, "factoryd.out.log"),
     stderrPath: path.join(paths.logsDir, "factoryd.err.log"),
     detached: true
