@@ -54,6 +54,7 @@ import {
   randomId,
   readEnvFileValues,
   readText,
+  resolveRuntimeScriptCommand,
   resolveReachableHttpUrl,
   runCommand,
   sampleResources,
@@ -110,6 +111,19 @@ interface ManagedRuntimeProcess {
   worktreePath: string;
   port: number;
   script: string;
+  healthcheckScript: string;
+}
+
+interface ResolvedRuntimeScripts {
+  worktreePath: string;
+  serveScript: string;
+  healthcheckScript: string;
+}
+
+interface RuntimeEnsureResult {
+  ok: boolean;
+  reason: "healthy" | "serve_script_not_configured" | "healthcheck_failed";
+  scripts: ResolvedRuntimeScripts;
 }
 
 class InterruptedTurnError extends Error {
@@ -389,7 +403,8 @@ class FactorySupervisor {
   private activeManagerThreadId?: string;
   private activeManagerHasDirectUserMessage = false;
   private activeManagerReplyToMessageId?: string;
-  private readonly managerToolToken = randomBytes(24).toString("hex");
+  private managerToolToken = "";
+  private managerThreadNeedsRotation = false;
   private workerSandboxCapabilities?: WorkerSandboxCapabilities & { sandboxMode: string };
 
   constructor(private config: FactoryProjectConfig, private readonly db: FactoryDatabase) {
@@ -411,6 +426,7 @@ class FactorySupervisor {
     await ensureDir(this.paths.worktreesDir);
     await ensureDir(this.paths.runtimeDir);
     await ensureDir(this.paths.runsDir);
+    await this.ensureManagerToolToken();
     await this.claimSupervisorPid();
 
     try {
@@ -444,6 +460,19 @@ class FactorySupervisor {
     if (existingPid === process.pid) {
       await writeText(this.paths.supervisorPidPath, "").catch(() => undefined);
     }
+  }
+
+  private async ensureManagerToolToken(): Promise<void> {
+    const existing = await readText(this.paths.managerToolTokenPath).catch(() => "");
+    const trimmed = existing.trim();
+    if (trimmed.length > 0) {
+      this.managerToolToken = trimmed;
+      return;
+    }
+
+    this.managerToolToken = randomBytes(24).toString("hex");
+    await writeText(this.paths.managerToolTokenPath, `${this.managerToolToken}\n`);
+    this.managerThreadNeedsRotation = true;
   }
 
   private async tick(): Promise<void> {
@@ -529,11 +558,14 @@ class FactorySupervisor {
       const client = this.getAppServerClient();
       const developerInstructions = await this.buildManagerInstructions();
       const threadId = await client.ensureManagerThread(
-        this.activeManagerThreadId ?? this.db.getAgentSession("manager", "thread")?.sessionId,
+        this.managerThreadNeedsRotation
+          ? undefined
+          : this.activeManagerThreadId ?? this.db.getAgentSession("manager", "thread")?.sessionId,
         this.config,
         developerInstructions,
         this.buildManagerThreadConfig()
       );
+      this.managerThreadNeedsRotation = false;
       this.activeManagerThreadId = threadId;
       this.db.upsertAgent({
         id: "manager",
@@ -2146,20 +2178,20 @@ class FactorySupervisor {
       await this.ensureStableProxyServer();
       const activeSlot = snapshot.stable.activeSlot;
       const activePort = this.runtimeSlotPort(activeSlot);
-      const stableScript = this.config.scripts.serveStable;
-      if (isPlaceholderScript(stableScript)) {
-        if (snapshot.stable.status !== "down") {
+      const ensured = await this.ensureRuntimeProcess(activeSlot, snapshot.stable.commit, activePort);
+      if (ensured.ok) {
+        if (snapshot.stable.status !== "healthy" || snapshot.stable.activeSlot !== activeSlot) {
           this.db.recordDeployment({
             projectId: this.config.projectId,
             target: "stable",
-            status: "down",
+            status: "healthy",
             url: stableUrl,
             commit: snapshot.stable.commit,
             activeSlot,
-            reason: "stable serve script not configured"
+            reason: "stable runtime healthy"
           });
         }
-      } else if (!(await this.ensureRuntimeProcess(activeSlot, snapshot.stable.commit, stableScript, activePort))) {
+      } else {
         this.db.recordDeployment({
           projectId: this.config.projectId,
           target: "stable",
@@ -2167,7 +2199,10 @@ class FactorySupervisor {
           url: stableUrl,
           commit: snapshot.stable.commit,
           activeSlot,
-          reason: "stable slot failed healthcheck"
+          reason:
+            ensured.reason === "serve_script_not_configured"
+              ? "stable serve script not configured"
+              : "stable slot failed healthcheck"
         });
       }
     } else {
@@ -2175,118 +2210,102 @@ class FactorySupervisor {
     }
 
     if (snapshot.preview.commit) {
-      const previewScript = this.config.scripts.servePreview;
-      if (isPlaceholderScript(previewScript)) {
-        if (snapshot.preview.status !== "down") {
+      const ensured = await this.ensureRuntimeProcess(
+        "preview",
+        snapshot.preview.commit,
+        this.config.ports.preview
+      );
+      if (ensured.ok) {
+        if (snapshot.preview.status !== "healthy") {
           this.db.recordDeployment({
             projectId: this.config.projectId,
             target: "preview",
-            status: "down",
+            status: "healthy",
             url: previewUrl,
             commit: snapshot.preview.commit,
-            reason: "preview serve script not configured"
+            reason: "preview runtime healthy"
           });
         }
-      } else if (
-        !(await this.ensureRuntimeProcess(
-          "preview",
-          snapshot.preview.commit,
-          previewScript,
-          this.config.ports.preview
-        ))
-      ) {
+      } else {
         this.db.recordDeployment({
           projectId: this.config.projectId,
           target: "preview",
           status: "down",
           url: previewUrl,
           commit: snapshot.preview.commit,
-          reason: "preview slot failed healthcheck"
+          reason:
+            ensured.reason === "serve_script_not_configured"
+              ? "preview serve script not configured"
+              : "preview slot failed healthcheck"
         });
       }
     }
   }
 
   private async bootstrapStableRuntime(): Promise<void> {
-    const serveScript = this.config.scripts.serveStable;
-    if (isPlaceholderScript(serveScript)) {
+    const commit = await currentCommit(this.config.repoRoot, this.config.defaultBranch);
+    const ensured = await this.ensureRuntimeProcess("stable-a", commit, this.config.ports.stableA);
+    if (!ensured.ok && ensured.reason === "serve_script_not_configured") {
       return;
     }
-
-    const commit = await currentCommit(this.config.repoRoot, this.config.defaultBranch);
-    const success = await this.ensureRuntimeProcess(
-      "stable-a",
-      commit,
-      serveScript,
-      this.config.ports.stableA
-    );
     await this.ensureStableProxyServer();
     const stableUrl = await this.resolveStableUrl();
     this.db.recordDeployment({
       projectId: this.config.projectId,
       target: "stable",
-      status: success ? "healthy" : "down",
+      status: ensured.ok ? "healthy" : "down",
       url: stableUrl,
       commit,
       activeSlot: "stable-a",
-      reason: success ? "bootstrap stable runtime" : "bootstrap stable runtime failed"
+      reason:
+        ensured.ok
+          ? "bootstrap stable runtime"
+          : ensured.reason === "serve_script_not_configured"
+            ? "stable serve script not configured"
+            : "bootstrap stable runtime failed"
     });
   }
 
   private async deployPreview(commit: string, reason: string): Promise<void> {
-    const script = this.config.scripts.servePreview;
-    if (isPlaceholderScript(script)) {
+    const ensured = await this.ensureRuntimeProcess("preview", commit, this.config.ports.preview);
+    if (!ensured.ok && ensured.reason === "serve_script_not_configured") {
       throw new Error("Preview serve script is not configured");
     }
-
-    const success = await this.ensureRuntimeProcess(
-      "preview",
-      commit,
-      script,
-      this.config.ports.preview
-    );
     const previewUrl = await this.resolvePreviewUrl();
     this.db.recordDeployment({
       projectId: this.config.projectId,
       target: "preview",
-      status: success ? "healthy" : "down",
+      status: ensured.ok ? "healthy" : "down",
       url: previewUrl,
       commit,
       reason
     });
     await this.sendTelegramMessage(
-      success ? "info_update" : "incident_alert",
-      success
+      ensured.ok ? "info_update" : "incident_alert",
+      ensured.ok
         ? `Preview updated: ${previewUrl}\nCommit: ${commit.slice(0, 12)}\n${reason}`
         : `Preview deployment failed for ${commit.slice(0, 12)}.\nExpected URL: ${previewUrl}\n${reason}`
     );
   }
 
   private async promoteCandidate(commit: string, reason: string): Promise<void> {
-    const serveScript = this.config.scripts.serveStable;
-    if (isPlaceholderScript(serveScript)) {
-      throw new Error("Stable serve script is not configured");
-    }
-
     const currentStable = this.db.getDeploymentSnapshot(this.config.projectId).stable;
     const nextSlot: RuntimeSlotName = currentStable.activeSlot === "stable-a" ? "stable-b" : "stable-a";
-    const success = await this.ensureRuntimeProcess(
-      nextSlot,
-      commit,
-      serveScript,
-      this.runtimeSlotPort(nextSlot)
-    );
+    const ensured = await this.ensureRuntimeProcess(nextSlot, commit, this.runtimeSlotPort(nextSlot));
+    if (!ensured.ok && ensured.reason === "serve_script_not_configured") {
+      throw new Error("Stable serve script is not configured");
+    }
     const stableUrl = await this.resolveStableUrl();
     this.db.recordDeployment({
       projectId: this.config.projectId,
       target: "stable",
-      status: success ? "healthy" : "down",
+      status: ensured.ok ? "healthy" : "down",
       url: stableUrl,
       commit,
       activeSlot: nextSlot,
       reason
     });
-    if (!success) {
+    if (!ensured.ok) {
       await this.sendTelegramMessage(
         "incident_alert",
         `Stable promotion failed for ${commit.slice(0, 12)}.\nExpected URL: ${stableUrl}\n${reason}`
@@ -2308,32 +2327,25 @@ class FactorySupervisor {
     reason: string,
     rollbackTag?: string
   ): Promise<void> {
-    const serveScript = this.config.scripts.serveStable;
-    if (isPlaceholderScript(serveScript)) {
-      throw new Error("Stable serve script is not configured");
-    }
-
     const currentStable = this.db.getDeploymentSnapshot(this.config.projectId).stable;
     const nextSlot: RuntimeSlotName = currentStable.activeSlot === "stable-a" ? "stable-b" : "stable-a";
-    const success = await this.ensureRuntimeProcess(
-      nextSlot,
-      commit,
-      serveScript,
-      this.runtimeSlotPort(nextSlot)
-    );
+    const ensured = await this.ensureRuntimeProcess(nextSlot, commit, this.runtimeSlotPort(nextSlot));
+    if (!ensured.ok && ensured.reason === "serve_script_not_configured") {
+      throw new Error("Stable serve script is not configured");
+    }
     const stableUrl = await this.resolveStableUrl();
     this.db.recordDeployment({
       projectId: this.config.projectId,
       target: "stable",
-      status: success ? "healthy" : "down",
+      status: ensured.ok ? "healthy" : "down",
       url: stableUrl,
       commit,
       activeSlot: nextSlot,
       reason: rollbackTag ? `${reason} (${rollbackTag})` : reason
     });
     await this.sendTelegramMessage(
-      success ? "ship_result" : "incident_alert",
-      success
+      ensured.ok ? "ship_result" : "incident_alert",
+      ensured.ok
         ? `Stable rolled back: ${stableUrl}\nCommit: ${commit.slice(0, 12)} (${nextSlot})\n${reason}`
         : `Stable rollback failed for ${commit.slice(0, 12)}.\nExpected URL: ${stableUrl}\n${reason}`
     );
@@ -2370,42 +2382,45 @@ class FactorySupervisor {
   private async ensureRuntimeProcess(
     slot: RuntimeSlotName,
     commit: string,
-    script: string,
     port: number
-  ): Promise<boolean> {
+  ): Promise<RuntimeEnsureResult> {
     const worktreePath = this.runtimeSlotWorktreePath(slot);
     const existing = this.runtimeProcesses.get(slot);
-    if (
-      existing &&
-      existing.child.exitCode === null &&
-      existing.commit === commit &&
-      existing.script === script
-    ) {
-      try {
-        await this.runRuntimeHealthcheck(worktreePath, port);
-        return true;
-      } catch {
+    if (existing && existing.child.exitCode === null && existing.commit === commit) {
+      const scripts = await this.resolveRuntimeScriptsForWorktree(slot, existing.worktreePath);
+      if (
+        existing.script === scripts.serveScript &&
+        existing.healthcheckScript === scripts.healthcheckScript
+      ) {
+        try {
+          await this.runRuntimeHealthcheck(worktreePath, port, scripts.healthcheckScript);
+          return {
+            ok: true,
+            reason: "healthy",
+            scripts
+          };
+        } catch {
+          await this.stopRuntimeProcess(slot);
+        }
+      } else {
         await this.stopRuntimeProcess(slot);
       }
     }
 
     await this.stopRuntimeProcess(slot);
-    await ensureDir(path.dirname(worktreePath));
-    await ensureDetachedWorktreeAtRef(this.config.repoRoot, worktreePath, commit);
-    await runCommand(
-      "bash",
-      [path.resolve(this.config.repoRoot, this.config.scripts.bootstrapWorktree), worktreePath],
-      {
-        cwd: this.config.repoRoot,
-        env: this.buildRuntimeEnvironment(port),
-        allowNonZeroExit: true
-      }
-    );
+    const scripts = await this.prepareRuntimeWorktree(slot, commit, port);
+    if (isPlaceholderScript(scripts.serveScript)) {
+      return {
+        ok: false,
+        reason: "serve_script_not_configured",
+        scripts
+      };
+    }
 
     const stdoutPath = path.join(this.paths.logsDir, `${slot}.out.log`);
     const stderrPath = path.join(this.paths.logsDir, `${slot}.err.log`);
     const started = await spawnLoggedShellCommand({
-      script,
+      script: scripts.serveScript,
       cwd: worktreePath,
       env: this.buildRuntimeEnvironment(port),
       stdoutPath,
@@ -2416,7 +2431,8 @@ class FactorySupervisor {
       commit,
       worktreePath,
       port,
-      script
+      script: scripts.serveScript,
+      healthcheckScript: scripts.healthcheckScript
     });
     started.child.on("exit", () => {
       const current = this.runtimeProcesses.get(slot);
@@ -2426,12 +2442,20 @@ class FactorySupervisor {
     });
 
     try {
-      await this.runRuntimeHealthcheck(worktreePath, port);
-      return true;
+      await this.runRuntimeHealthcheck(worktreePath, port, scripts.healthcheckScript);
+      return {
+        ok: true,
+        reason: "healthy",
+        scripts
+      };
     } catch (error) {
       await this.stopRuntimeProcess(slot);
       console.error(`${slot} healthcheck failed: ${error instanceof Error ? error.message : String(error)}`);
-      return false;
+      return {
+        ok: false,
+        reason: "healthcheck_failed",
+        scripts
+      };
     }
   }
 
@@ -2472,6 +2496,74 @@ class FactorySupervisor {
     return this.config.ports.preview;
   }
 
+  private configuredServeScriptForSlot(slot: RuntimeSlotName): string {
+    return slot === "preview" ? this.config.scripts.servePreview : this.config.scripts.serveStable;
+  }
+
+  private async safeConfiguredScriptForWorktree(
+    worktreePath: string,
+    script: string,
+    placeholderLabel: "serve" | "healthcheck"
+  ): Promise<string> {
+    if (!/^(npm|pnpm|yarn|bun)\s+run\b/i.test(script.trim())) {
+      return script;
+    }
+
+    return (await fileExists(path.join(worktreePath, "package.json")))
+      ? script
+      : `echo '${placeholderLabel} script not configured'`;
+  }
+
+  private async resolveRuntimeScriptsForWorktree(
+    slot: RuntimeSlotName,
+    worktreePath: string
+  ): Promise<ResolvedRuntimeScripts> {
+    const detected = await detectPackageManagerAndScripts(worktreePath);
+    const detectedServeScript =
+      slot === "preview" ? detected.scripts.servePreview : detected.scripts.serveStable;
+    const configuredServeScript = await this.safeConfiguredScriptForWorktree(
+      worktreePath,
+      this.configuredServeScriptForSlot(slot),
+      "serve"
+    );
+    const configuredHealthcheckScript = await this.safeConfiguredScriptForWorktree(
+      worktreePath,
+      this.config.scripts.healthcheck,
+      "healthcheck"
+    );
+    return {
+      worktreePath,
+      serveScript: resolveRuntimeScriptCommand(
+        detectedServeScript,
+        configuredServeScript
+      ),
+      healthcheckScript: resolveRuntimeScriptCommand(
+        detected.scripts.healthcheck,
+        configuredHealthcheckScript
+      )
+    };
+  }
+
+  private async prepareRuntimeWorktree(
+    slot: RuntimeSlotName,
+    commit: string,
+    port: number
+  ): Promise<ResolvedRuntimeScripts> {
+    const worktreePath = this.runtimeSlotWorktreePath(slot);
+    await ensureDir(path.dirname(worktreePath));
+    await ensureDetachedWorktreeAtRef(this.config.repoRoot, worktreePath, commit);
+    await runCommand(
+      "bash",
+      [path.resolve(this.config.repoRoot, this.config.scripts.bootstrapWorktree), worktreePath],
+      {
+        cwd: this.config.repoRoot,
+        env: this.buildRuntimeEnvironment(port),
+        allowNonZeroExit: true
+      }
+    );
+    return await this.resolveRuntimeScriptsForWorktree(slot, worktreePath);
+  }
+
   private buildRuntimeEnvironment(port: number): NodeJS.ProcessEnv {
     return {
       ...process.env,
@@ -2480,8 +2572,12 @@ class FactorySupervisor {
     };
   }
 
-  private async runRuntimeHealthcheck(worktreePath: string, port: number): Promise<void> {
-    await waitForSuccessfulCommand(this.config.scripts.healthcheck, {
+  private async runRuntimeHealthcheck(
+    worktreePath: string,
+    port: number,
+    healthcheckScript: string
+  ): Promise<void> {
+    await waitForSuccessfulCommand(healthcheckScript, {
       cwd: worktreePath,
       env: this.buildRuntimeEnvironment(port),
       timeoutMs: 60_000,
@@ -2723,13 +2819,23 @@ class FactorySupervisor {
 
   private async refreshDetectedScriptsFromWorktree(worktreePath: string): Promise<void> {
     const detected = await detectPackageManagerAndScripts(worktreePath);
-    if (JSON.stringify(detected.scripts) === JSON.stringify(this.config.scripts)) {
+    const mergedScripts = { ...detected.scripts };
+    for (const key of Object.keys(mergedScripts) as Array<keyof typeof mergedScripts>) {
+      const detectedScript = mergedScripts[key];
+      const existingScript = this.config.scripts[key];
+      mergedScripts[key] =
+        isPlaceholderScript(detectedScript) && !isPlaceholderScript(existingScript)
+          ? existingScript
+          : detectedScript;
+    }
+
+    if (JSON.stringify(mergedScripts) === JSON.stringify(this.config.scripts)) {
       return;
     }
 
     this.config = {
       ...this.config,
-      scripts: detected.scripts
+      scripts: mergedScripts
     };
     await this.persistConfig();
   }
@@ -2822,7 +2928,12 @@ class FactorySupervisor {
 
         if (request.method === "POST" && url.pathname === "/internal/manager-tool") {
           const authorization = request.headers.authorization;
-          if (authorization !== `Bearer ${this.managerToolToken}`) {
+          const remoteAddress = request.socket.remoteAddress;
+          const isLoopback =
+            remoteAddress === "127.0.0.1" ||
+            remoteAddress === "::1" ||
+            remoteAddress === "::ffff:127.0.0.1";
+          if (!isLoopback && authorization !== `Bearer ${this.managerToolToken}`) {
             response.writeHead(403, { "content-type": "application/json" });
             response.end(JSON.stringify({ ok: false, error: "forbidden" }));
             return;

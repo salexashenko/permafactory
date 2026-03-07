@@ -898,6 +898,8 @@ export interface FactoryProjectConfig {
 }
 ```
 
+For `stable` and `preview` deployments, `factoryd` should resolve the serve and healthcheck commands from the runtime worktree for the commit being deployed first, and only fall back to `factory.config.ts` when that commit does not advertise a usable command.
+
 ### Manager turn output
 
 The manager must return JSON that matches this schema. Use app-server `turn/start.outputSchema` to enforce it.

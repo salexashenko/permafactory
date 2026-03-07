@@ -14,6 +14,7 @@ import {
   normalizeManagerTurnOutput,
   parseTopLevelBacklogItems,
   readEnvFileValues,
+  resolveRuntimeScriptCommand,
   selectReachableHost,
   shouldDeliverTelegramNotification,
   upsertEnvFileValue,
@@ -233,6 +234,24 @@ test("shouldDeliverTelegramNotification only allows direct replies, decisions, s
     true
   );
   assert.equal(shouldDeliverTelegramNotification("incident_alert"), false);
+});
+
+test("resolveRuntimeScriptCommand prefers the deployed worktree command when available", () => {
+  assert.equal(
+    resolveRuntimeScriptCommand("npm run preview", "echo 'serve script not configured'"),
+    "npm run preview"
+  );
+  assert.equal(
+    resolveRuntimeScriptCommand("npm run preview", "npm run serve"),
+    "npm run preview"
+  );
+});
+
+test("resolveRuntimeScriptCommand falls back to configured overrides when detection has no command", () => {
+  assert.equal(
+    resolveRuntimeScriptCommand("echo 'serve script not configured'", "node scripts/custom-serve.mjs"),
+    "node scripts/custom-serve.mjs"
+  );
 });
 
 test("manager output schema accepts a minimal valid payload", async () => {

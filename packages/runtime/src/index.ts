@@ -63,6 +63,7 @@ export interface FactoryPaths {
   bootstrapScriptPath: string;
   lockPath: string;
   supervisorPidPath: string;
+  managerToolTokenPath: string;
 }
 
 export interface NormalizeManagerTurnOutputOptions {
@@ -98,7 +99,8 @@ export function getFactoryPaths(repoRoot: string): FactoryPaths {
     scriptsDir: path.join(factoryRoot, "scripts"),
     bootstrapScriptPath: path.join(factoryRoot, "scripts", "bootstrap-worktree.sh"),
     lockPath: path.join(factoryRoot, ".lock"),
-    supervisorPidPath: path.join(factoryRoot, "factoryd.pid")
+    supervisorPidPath: path.join(factoryRoot, "factoryd.pid"),
+    managerToolTokenPath: path.join(factoryRoot, "manager-tool.token")
   };
 }
 
@@ -1161,6 +1163,13 @@ export async function safeStat(targetPath: string): Promise<Awaited<ReturnType<t
 
 export function isPlaceholderScript(script: string): boolean {
   return /not configured/i.test(script);
+}
+
+export function resolveRuntimeScriptCommand(
+  detectedScript: string,
+  configuredScript: string
+): string {
+  return !isPlaceholderScript(detectedScript) ? detectedScript : configuredScript;
 }
 
 export async function sendTelegramApiRequest<T>(
