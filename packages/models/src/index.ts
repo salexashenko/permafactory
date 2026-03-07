@@ -44,6 +44,15 @@ export type TelegramOutboundKind =
   | "daily_digest";
 export type WorkerResultStatus = "completed" | "blocked" | "failed";
 export type CheckStatus = "passed" | "failed" | "not_run";
+export type ManagerToolName =
+  | "get_factory_status"
+  | "start_task"
+  | "cancel_task"
+  | "start_review"
+  | "integrate_branch"
+  | "apply_deployment"
+  | "request_decision"
+  | "reply_user";
 
 export interface WorkerSandboxCapabilities {
   canBindListenSockets: boolean;
@@ -187,10 +196,12 @@ export interface ManagerTurnInput {
     receivedAt: string;
     text: string;
     urgent: boolean;
+    replyToMessageId?: string;
   }>;
   inboxItems: Array<{
     id: string;
     source: "telegram" | "backlog_file";
+    externalId?: string;
     receivedAt: string;
     text: string;
     status: "new" | "triaged" | "done";
@@ -280,6 +291,7 @@ export interface ManagerTurnInput {
       userMessages: string[];
     };
     mismatchHints: string[];
+    toolCalls: string[];
     rawOutput?: Record<string, unknown>;
   }>;
 }
@@ -369,14 +381,33 @@ export interface TaskContract {
 
 export interface ManagerTurnOutput {
   summary: string;
-  userMessages: TelegramOutboundMessage[];
-  tasksToStart: TaskContract[];
-  tasksToCancel: string[];
-  reviewsToStart: ReviewRequest[];
-  integrations: IntegrationRequest[];
-  deployments: DeploymentIntent[];
-  decisions: DecisionRequest[];
   assumptions: string[];
+}
+
+export interface ManagerToolCallRecord {
+  requestId: string;
+  threadId?: string;
+  turnId?: string;
+  toolName: ManagerToolName;
+  status: "running" | "completed" | "failed";
+  args?: Record<string, unknown>;
+  result?: Record<string, unknown>;
+  errorText?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ManagerToolHttpRequest {
+  requestId: string;
+  toolName: ManagerToolName;
+  args: Record<string, unknown>;
+}
+
+export interface ManagerToolHttpResponse {
+  ok: boolean;
+  cached?: boolean;
+  result?: Record<string, unknown>;
+  error?: string;
 }
 
 export interface WorkerRun {

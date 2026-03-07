@@ -2,6 +2,7 @@ import http from "node:http";
 import net from "node:net";
 import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { open } from "node:fs/promises";
 import process from "node:process";
 import type { Duplex } from "node:stream";
@@ -17,9 +18,17 @@ import {
 import { DEFAULT_MANAGER_THREAD_NAME } from "@permafactory/models";
 import type {
   CodingWorkerResult,
+  DecisionRequest,
+  DeploymentIntent,
   FactoryProjectConfig,
+  IntegrationRequest,
+  ManagerToolCallRecord,
+  ManagerToolHttpRequest,
+  ManagerToolHttpResponse,
+  ManagerToolName,
   ManagerTurnInput,
   ManagerTurnOutput,
+  ReviewRequest,
   ReviewerResult,
   TaskContract,
   TesterResult,
@@ -66,6 +75,17 @@ type JsonRpcResponse = {
 };
 
 type RuntimeSlotName = "stable-a" | "stable-b" | "preview";
+
+const MANAGER_TOOL_NAMES: ReadonlySet<ManagerToolName> = new Set([
+  "get_factory_status",
+  "start_task",
+  "cancel_task",
+  "start_review",
+  "integrate_branch",
+  "apply_deployment",
+  "request_decision",
+  "reply_user"
+]);
 
 interface ManagedRuntimeProcess {
   child: ChildProcess;
@@ -219,13 +239,15 @@ class AppServerClient {
   async ensureManagerThread(
     threadId: string | undefined,
     config: FactoryProjectConfig,
-    developerInstructions: string
+    developerInstructions: string,
+    threadConfig?: Record<string, unknown>
   ): Promise<string> {
     const params = {
       model: config.codex.managerModel,
       cwd: config.repoRoot,
       approvalPolicy: "never",
       sandbox: config.codex.sandboxMode,
+      config: threadConfig ?? null,
       serviceName: "permafactory",
       developerInstructions,
       personality: null,
@@ -348,6 +370,9 @@ class FactorySupervisor {
   private lastNoActiveWorkWakeAt = 0;
   private activeManagerTurnId?: string;
   private activeManagerThreadId?: string;
+  private activeManagerHasDirectUserMessage = false;
+  private activeManagerReplyToMessageId?: string;
+  private readonly managerToolToken = randomBytes(24).toString("hex");
   private workerSandboxCapabilities?: WorkerSandboxCapabilities & { sandboxMode: string };
 
   constructor(private config: FactoryProjectConfig, private readonly db: FactoryDatabase) {
@@ -373,9 +398,7 @@ class FactorySupervisor {
 
     try {
       await this.refreshProjectState();
-      if (!once) {
-        await this.startDashboardServer();
-      }
+      await this.startDashboardServer();
 
       do {
         await this.tick();
@@ -415,7 +438,6 @@ class FactorySupervisor {
     await this.reconcileRuntimeTargets(appearsGreenfield);
     await this.reconcileStaleWorkers();
     await this.reconcileCompletedTaskBranches();
-    const workerSandboxCapabilities = await this.ensureWorkerSandboxCapabilities();
 
     const expiredDecisions = this.db.expireTimedOutDecisions();
     if (expiredDecisions.length > 0) {
@@ -426,17 +448,7 @@ class FactorySupervisor {
       this.pendingManagerWakeReasons.add("decision_timeout");
     }
 
-    const agents = this.db.listAgents(this.config.projectId);
-    const activeWorkers = agents.filter(
-      (agent) => agent.role !== "manager" && agent.status === "running"
-    ).length;
-    const sampledResources = await sampleResources(this.config.scheduler.maxWorkers, activeWorkers);
-    const resources: ManagerTurnInput["resources"] = {
-      ...sampledResources,
-      workerSandbox: {
-        canBindListenSockets: workerSandboxCapabilities.canBindListenSockets
-      }
-    };
+    const resources = await this.sampleManagerResources();
     this.db.recordHealthSample(this.config.projectId, resources);
     await this.maybeSendDailyDigest(resources);
     this.maybeWakeManagerForContinuity();
@@ -502,7 +514,8 @@ class FactorySupervisor {
       const threadId = await client.ensureManagerThread(
         this.activeManagerThreadId ?? this.db.getAgentSession("manager", "thread")?.sessionId,
         this.config,
-        developerInstructions
+        developerInstructions,
+        this.buildManagerThreadConfig()
       );
       this.activeManagerThreadId = threadId;
       this.db.upsertAgent({
@@ -522,6 +535,8 @@ class FactorySupervisor {
       });
 
       const input = await this.buildManagerInput(resources);
+      this.activeManagerHasDirectUserMessage = input.userMessages.length > 0;
+      this.activeManagerReplyToMessageId = input.userMessages.at(-1)?.replyToMessageId;
       const startedTurn = await client.startTurn(
         threadId,
         JSON.stringify(input, null, 2),
@@ -592,6 +607,8 @@ class FactorySupervisor {
       this.pendingManagerWakeReasons.add("manager_failure");
     } finally {
       this.activeManagerTurnId = undefined;
+      this.activeManagerHasDirectUserMessage = false;
+      this.activeManagerReplyToMessageId = undefined;
       this.managerRunning = false;
     }
   }
@@ -624,6 +641,30 @@ class FactorySupervisor {
     return `${prompt}\n\n## Project Context\n\n- repoRoot: ${this.config.repoRoot}\n- defaultBranch: ${this.config.defaultBranch}\n- candidateBranch: ${this.config.candidateBranch}\n- projectSpecPath: ${this.config.projectSpecPath}\n- managerThreadName: ${DEFAULT_MANAGER_THREAD_NAME}\n`;
   }
 
+  private buildManagerThreadConfig(): Record<string, unknown> {
+    const managerMcpPath = path.resolve(
+      this.factoryRepoRoot,
+      "apps/factory-manager-mcp/src/main.ts"
+    );
+    const tsxBinPath = path.resolve(this.factoryRepoRoot, "node_modules/.bin/tsx");
+    return {
+      mcp_servers: {
+        permafactory_manager: {
+          command: tsxBinPath,
+          args: [managerMcpPath],
+          env: {
+            PERMAFACTORY_MANAGER_DASHBOARD_URL: this.dashboardBaseUrl(),
+            PERMAFACTORY_MANAGER_TOOL_TOKEN: this.managerToolToken
+          }
+        }
+      }
+    };
+  }
+
+  private dashboardBaseUrl(): string {
+    return `http://127.0.0.1:${this.config.ports.dashboard}`;
+  }
+
   private async buildManagerInput(resources: ManagerTurnInput["resources"]): Promise<ManagerTurnInput> {
     const input = this.db.getManagerInput(this.config);
     input.repo.dirtyFiles = await listDirtyFiles(this.config.repoRoot);
@@ -641,6 +682,21 @@ class FactorySupervisor {
     input.resources = resources;
     input.deployments = this.db.getDeploymentSnapshot(this.config.projectId);
     return input;
+  }
+
+  private async sampleManagerResources(): Promise<ManagerTurnInput["resources"]> {
+    const workerSandboxCapabilities = await this.ensureWorkerSandboxCapabilities();
+    const agents = this.db.listAgents(this.config.projectId);
+    const activeWorkers = agents.filter(
+      (agent) => agent.role !== "manager" && agent.status === "running"
+    ).length;
+    const sampledResources = await sampleResources(this.config.scheduler.maxWorkers, activeWorkers);
+    return {
+      ...sampledResources,
+      workerSandbox: {
+        canBindListenSockets: workerSandboxCapabilities.canBindListenSockets
+      }
+    };
   }
 
   private async enrichManagerTaskFacts(input: ManagerTurnInput): Promise<void> {
@@ -899,111 +955,168 @@ class FactorySupervisor {
   private async applyManagerOutput(
     output: ManagerTurnOutput,
     wakeReasons: string[],
-    hasDirectUserMessage: boolean
+    _hasDirectUserMessage: boolean
   ): Promise<void> {
     console.log(`[manager] ${output.summary}`);
     if (wakeReasons.length > 0) {
       console.log(`[manager] wake reasons: ${wakeReasons.join(", ")}`);
     }
-    const actionPreview = this.buildManagerActionPreview(output);
+    const toolCalls = this.activeManagerTurnId
+      ? this.db.listManagerToolCallsByTurn(this.config.projectId, this.activeManagerTurnId)
+      : [];
+    const actionPreview = this.buildManagerActionPreviewFromToolCalls(toolCalls);
     const mismatchHints = this.computeManagerTurnMismatchHints(output.summary, actionPreview);
     this.db.insertManagerTurn({
       projectId: this.config.projectId,
+      turnId: this.activeManagerTurnId,
       summary: output.summary,
       wakeReasons,
-      actionCounts: {
-        tasksToStart: output.tasksToStart.length,
-        tasksToCancel: output.tasksToCancel.length,
-        reviewsToStart: output.reviewsToStart.length,
-        integrations: output.integrations.length,
-        deployments: output.deployments.length,
-        decisions: output.decisions.length,
-        userMessages: output.userMessages.length
-      },
+      actionCounts: this.buildManagerActionCounts(actionPreview),
       actionPreview,
       mismatchHints,
+      toolCalls: this.buildManagerToolCallPreview(toolCalls),
       rawOutput: JSON.parse(JSON.stringify(output)) as Record<string, unknown>
     });
-
-    for (const decision of output.decisions) {
-      await this.maybeCreateDecision(decision);
-    }
-
-    let directResponseSent = false;
-    for (const message of output.userMessages) {
-      const isDirectUserResponse =
-        hasDirectUserMessage && message.kind === "info_update" && !directResponseSent;
-      const delivered = await this.sendTelegramMessage(
-        message.kind,
-        message.text,
-        message.replyToMessageId,
-        message.decisionId,
-        undefined,
-        { isDirectUserResponse }
-      );
-      if (delivered && message.kind === "info_update") {
-        directResponseSent = true;
-      }
-    }
-
-    for (const taskId of output.tasksToCancel) {
-      await this.cancelTask(taskId);
-    }
-
-    for (const contract of output.tasksToStart) {
-      await this.materializeAndStartTask(contract);
-    }
-
-    for (const review of output.reviewsToStart) {
-      await this.startReviewRequest(review);
-    }
-
-    for (const integration of output.integrations) {
-      try {
-        await this.integrateRequest(integration);
-      } catch (error) {
-        const taskForEvent =
-          (integration.taskId ? this.db.getTask(integration.taskId) : undefined) ??
-          (integration.branch ? this.findTaskByBranch(integration.branch) : undefined);
-        if (taskForEvent) {
-          this.db.insertTaskEvent(
-            taskForEvent.id,
-            "failed",
-            `Integration failed: ${error instanceof Error ? error.message : String(error)}`
-          );
-        }
-        this.pendingManagerWakeReasons.add("integration_failure");
-      }
-    }
-
-    for (const deployment of output.deployments) {
-      try {
-        await this.handleDeploymentIntent(deployment);
-      } catch (error) {
-        this.pendingManagerWakeReasons.add("deployment_failure");
-        await this.sendTelegramMessage(
-          "incident_alert",
-          `Deployment ${deployment.kind} failed: ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
-    }
   }
 
-  private buildManagerActionPreview(
-    output: ManagerTurnOutput
+  private buildManagerActionPreviewFromToolCalls(
+    toolCalls: ManagerToolCallRecord[]
   ): ManagerTurnInput["recentManagerTurns"][number]["actionPreview"] {
-    return {
-      tasksToStart: output.tasksToStart.map((task) => `${task.id}:${task.branchName}`),
-      tasksToCancel: output.tasksToCancel,
-      reviewsToStart: output.reviewsToStart.map((review) => `${review.branch}->${review.baseBranch}`),
-      integrations: output.integrations.map(
-        (integration) =>
-          `${integration.branch ?? integration.taskId ?? "unknown"}->${integration.targetBranch ?? "default"}`
-      ),
-      deployments: output.deployments.map((deployment) => deployment.kind),
-      decisions: output.decisions.map((decision) => `${decision.id}:${decision.title}`),
-      userMessages: output.userMessages.map((message) => `${message.kind}:${message.text.slice(0, 80)}`)
+    const preview: ManagerTurnInput["recentManagerTurns"][number]["actionPreview"] = {
+      tasksToStart: [],
+      tasksToCancel: [],
+      reviewsToStart: [],
+      integrations: [],
+      deployments: [],
+      decisions: [],
+      userMessages: []
     };
+
+    for (const call of toolCalls) {
+      if (call.status !== "completed") {
+        continue;
+      }
+
+      const args = call.args ?? {};
+      switch (call.toolName) {
+        case "start_task":
+          if (typeof args.id === "string" && typeof args.branchName === "string") {
+            preview.tasksToStart.push(`${args.id}:${args.branchName}`);
+          }
+          break;
+        case "cancel_task":
+          if (typeof args.taskId === "string") {
+            preview.tasksToCancel.push(args.taskId);
+          }
+          break;
+        case "start_review":
+          if (typeof args.branch === "string" && typeof args.baseBranch === "string") {
+            preview.reviewsToStart.push(`${args.branch}->${args.baseBranch}`);
+          }
+          break;
+        case "integrate_branch":
+          if (typeof args.branch === "string") {
+            preview.integrations.push(`${args.branch}->${typeof args.targetBranch === "string" ? args.targetBranch : "default"}`);
+          } else if (typeof args.taskId === "string") {
+            preview.integrations.push(`${args.taskId}->${typeof args.targetBranch === "string" ? args.targetBranch : "default"}`);
+          }
+          break;
+        case "apply_deployment":
+          if (typeof args.kind === "string") {
+            preview.deployments.push(args.kind);
+          }
+          break;
+        case "request_decision":
+          if (
+            call.result?.outcome === "created" &&
+            typeof args.id === "string" &&
+            typeof args.title === "string"
+          ) {
+            preview.decisions.push(`${args.id}:${args.title}`);
+          }
+          break;
+        case "reply_user":
+          if (
+            call.result?.delivered === true &&
+            typeof args.kind === "string" &&
+            typeof args.text === "string"
+          ) {
+            preview.userMessages.push(`${args.kind}:${args.text.slice(0, 80)}`);
+          }
+          break;
+        case "get_factory_status":
+          break;
+      }
+    }
+
+    return preview;
+  }
+
+  private buildManagerActionCounts(
+    actionPreview: ManagerTurnInput["recentManagerTurns"][number]["actionPreview"]
+  ): ManagerTurnInput["recentManagerTurns"][number]["actionCounts"] {
+    return {
+      tasksToStart: actionPreview.tasksToStart.length,
+      tasksToCancel: actionPreview.tasksToCancel.length,
+      reviewsToStart: actionPreview.reviewsToStart.length,
+      integrations: actionPreview.integrations.length,
+      deployments: actionPreview.deployments.length,
+      decisions: actionPreview.decisions.length,
+      userMessages: actionPreview.userMessages.length
+    };
+  }
+
+  private buildManagerToolCallPreview(toolCalls: ManagerToolCallRecord[]): string[] {
+    return toolCalls.map((call) => this.summarizeManagerToolCall(call));
+  }
+
+  private summarizeManagerToolCall(call: ManagerToolCallRecord): string {
+    const args = call.args ?? {};
+    let subject = "";
+    switch (call.toolName) {
+      case "start_task":
+        if (typeof args.id === "string" && typeof args.branchName === "string") {
+          subject = `:${args.id}:${args.branchName}`;
+        }
+        break;
+      case "cancel_task":
+        if (typeof args.taskId === "string") {
+          subject = `:${args.taskId}`;
+        }
+        break;
+      case "start_review":
+        if (typeof args.branch === "string" && typeof args.baseBranch === "string") {
+          subject = `:${args.branch}->${args.baseBranch}`;
+        }
+        break;
+      case "integrate_branch":
+        if (typeof args.branch === "string") {
+          subject = `:${args.branch}->${typeof args.targetBranch === "string" ? args.targetBranch : "default"}`;
+        } else if (typeof args.taskId === "string") {
+          subject = `:${args.taskId}->${typeof args.targetBranch === "string" ? args.targetBranch : "default"}`;
+        }
+        break;
+      case "apply_deployment":
+        if (typeof args.kind === "string") {
+          subject = `:${args.kind}`;
+        }
+        break;
+      case "request_decision":
+        if (typeof args.id === "string" && typeof args.title === "string") {
+          subject = `:${args.id}:${args.title}`;
+        }
+        break;
+      case "reply_user":
+        if (typeof args.kind === "string") {
+          subject = `:${args.kind}`;
+        }
+        break;
+      case "get_factory_status":
+        break;
+    }
+
+    const suffix = call.errorText ? `:${call.errorText.slice(0, 80)}` : "";
+    return `${call.status}:${call.toolName}${subject}${suffix}`;
   }
 
   private computeManagerTurnMismatchHints(
@@ -1042,7 +1155,209 @@ class FactorySupervisor {
     return hints;
   }
 
-  private async maybeCreateDecision(decision: ManagerTurnOutput["decisions"][number]): Promise<void> {
+  private async executeManagerToolCall(
+    request: ManagerToolHttpRequest
+  ): Promise<ManagerToolHttpResponse> {
+    if (!this.activeManagerTurnId || !this.activeManagerThreadId) {
+      return { ok: false, error: "manager tools require an active manager turn" };
+    }
+
+    const existing = this.db.getManagerToolCall(
+      this.config.projectId,
+      request.requestId,
+      request.toolName
+    );
+    if (existing?.status === "completed") {
+      return { ok: true, cached: true, result: existing.result ?? {} };
+    }
+    if (existing?.status === "failed") {
+      return { ok: false, cached: true, error: existing.errorText ?? "cached tool call failure" };
+    }
+    if (existing?.status === "running") {
+      return { ok: false, cached: true, error: "manager tool call is already running" };
+    }
+
+    this.db.recordManagerToolCallStart({
+      projectId: this.config.projectId,
+      threadId: this.activeManagerThreadId,
+      turnId: this.activeManagerTurnId,
+      requestId: request.requestId,
+      toolName: request.toolName,
+      args: request.args
+    });
+
+    try {
+      const result = await this.dispatchManagerToolCall(request.toolName, request.args);
+      this.db.finishManagerToolCall({
+        projectId: this.config.projectId,
+        requestId: request.requestId,
+        toolName: request.toolName,
+        status: "completed",
+        result
+      });
+      return { ok: true, cached: false, result };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.db.finishManagerToolCall({
+        projectId: this.config.projectId,
+        requestId: request.requestId,
+        toolName: request.toolName,
+        status: "failed",
+        errorText: message
+      });
+      return { ok: false, cached: false, error: message };
+    }
+  }
+
+  private async dispatchManagerToolCall(
+    toolName: ManagerToolName,
+    args: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
+    switch (toolName) {
+      case "get_factory_status": {
+        const resources = await this.sampleManagerResources();
+        const snapshot = await this.buildManagerInput(resources);
+        return { snapshot: JSON.parse(JSON.stringify(snapshot)) as Record<string, unknown> };
+      }
+      case "start_task": {
+        const contract = args as unknown as TaskContract;
+        await this.materializeAndStartTask(contract);
+        const task = this.db.getTask(contract.id);
+        return {
+          taskId: contract.id,
+          status: task?.status ?? "queued",
+          branchName: contract.branchName,
+          worktreePath: contract.worktreePath
+        };
+      }
+      case "cancel_task": {
+        const taskId = this.requireStringArg(args, "taskId");
+        await this.cancelTask(taskId);
+        return {
+          taskId,
+          status: this.db.getTask(taskId)?.status ?? "cancelled"
+        };
+      }
+      case "start_review": {
+        const review = args as unknown as ReviewRequest;
+        await this.startReviewRequest(review);
+        return {
+          taskId: review.taskId,
+          branch: review.branch,
+          baseBranch: review.baseBranch
+        };
+      }
+      case "integrate_branch": {
+        const integration = args as unknown as IntegrationRequest;
+        await this.integrateRequest(integration);
+        const targetBranch = integration.targetBranch ?? this.config.candidateBranch;
+        return {
+          taskId: integration.taskId,
+          branch: integration.branch,
+          targetBranch,
+          commit: await currentCommit(this.config.repoRoot, targetBranch).catch(() => "")
+        };
+      }
+      case "apply_deployment": {
+        const deployment = args as unknown as DeploymentIntent;
+        await this.handleDeploymentIntent(deployment);
+        const snapshot = this.db.getDeploymentSnapshot(this.config.projectId);
+        if (deployment.kind === "deploy_preview") {
+          return {
+            kind: deployment.kind,
+            target: "preview",
+            status: snapshot.preview.status,
+            url: snapshot.preview.url,
+            commit: snapshot.preview.commit
+          };
+        }
+        return {
+          kind: deployment.kind,
+          target: "stable",
+          status: snapshot.stable.status,
+          url: snapshot.stable.url,
+          commit: snapshot.stable.commit
+        };
+      }
+      case "request_decision": {
+        const decision = args as unknown as DecisionRequest;
+        return await this.maybeCreateDecision(decision);
+      }
+      case "reply_user": {
+        const kind = this.requireStringArg(args, "kind");
+        const text = this.requireStringArg(args, "text");
+        const replyToMessageId =
+          (typeof args.replyToMessageId === "string" ? args.replyToMessageId : undefined) ??
+          this.activeManagerReplyToMessageId;
+        const decisionId = typeof args.decisionId === "string" ? args.decisionId : undefined;
+        const delivered = await this.sendTelegramMessage(
+          kind,
+          text,
+          replyToMessageId,
+          decisionId,
+          undefined,
+          {
+            isDirectUserResponse: kind === "info_update" && this.activeManagerHasDirectUserMessage
+          }
+        );
+        return {
+          kind,
+          delivered,
+          replyToMessageId
+        };
+      }
+    }
+
+    throw new Error(`Unknown manager tool: ${String(toolName)}`);
+  }
+
+  private requireStringArg(args: Record<string, unknown>, key: string): string {
+    const value = args[key];
+    if (typeof value !== "string" || value.length === 0) {
+      throw new Error(`Missing required string argument: ${key}`);
+    }
+    return value;
+  }
+
+  private async readJsonRequestBody(request: http.IncomingMessage): Promise<Record<string, unknown>> {
+    const body = await new Promise<string>((resolve, reject) => {
+      let chunks = "";
+      request.setEncoding("utf8");
+      request.on("data", (chunk) => {
+        chunks += chunk;
+      });
+      request.on("end", () => resolve(chunks));
+      request.on("error", reject);
+    });
+    return JSON.parse(body) as Record<string, unknown>;
+  }
+
+  private parseManagerToolHttpRequest(body: Record<string, unknown>): ManagerToolHttpRequest {
+    const requestId = body.requestId;
+    const toolName = body.toolName;
+    const args = body.args;
+    if (typeof requestId !== "string" || requestId.length === 0) {
+      throw new Error("manager tool request missing requestId");
+    }
+    if (typeof toolName !== "string" || toolName.length === 0) {
+      throw new Error("manager tool request missing toolName");
+    }
+    if (!MANAGER_TOOL_NAMES.has(toolName as ManagerToolName)) {
+      throw new Error(`unknown manager tool: ${toolName}`);
+    }
+    if (!args || typeof args !== "object" || Array.isArray(args)) {
+      throw new Error("manager tool request missing args object");
+    }
+    return {
+      requestId,
+      toolName: toolName as ManagerToolName,
+      args: args as Record<string, unknown>
+    };
+  }
+
+  private async maybeCreateDecision(
+    decision: DecisionRequest
+  ): Promise<Record<string, unknown>> {
     const budget = this.db.getDecisionBudget(
       this.config.projectId,
       this.config.timezone,
@@ -1050,15 +1365,15 @@ class FactorySupervisor {
       this.config.decisionBudget.reserveCritical
     );
     if (this.db.findOpenDecisionByDedupe(this.config.projectId, decision.dedupeKey)) {
-      return;
+      return { outcome: "duplicate_open_decision", decisionId: decision.id };
     }
 
     if (budget.remaining <= 0) {
-      return;
+      return { outcome: "budget_exhausted", decisionId: decision.id };
     }
 
     if (decision.priority !== "critical" && budget.remainingNormal <= 0) {
-      return;
+      return { outcome: "critical_reserve_only", decisionId: decision.id };
     }
 
     this.db.insertDecision(this.config.projectId, decision);
@@ -1078,6 +1393,7 @@ class FactorySupervisor {
       decision.id,
       keyboard
     );
+    return { outcome: "created", decisionId: decision.id };
   }
 
   private async sendTelegramMessage(
@@ -1222,11 +1538,13 @@ class FactorySupervisor {
     return this.db.listTasks(this.config.projectId).find((task) => task.branchName === branchName);
   }
 
-  private async startReviewRequest(review: ManagerTurnOutput["reviewsToStart"][number]): Promise<void> {
+  private async startReviewRequest(review: ReviewRequest): Promise<void> {
     const task =
       (review.taskId ? this.db.getTask(review.taskId) : undefined) ?? this.findTaskByBranch(review.branch);
     if (!task?.contract) {
-      return;
+      throw new Error(
+        `Cannot start review for unknown branch target ${review.taskId ?? review.branch ?? "unknown"}`
+      );
     }
 
     if (
@@ -1317,7 +1635,7 @@ class FactorySupervisor {
       .filter((file) => file.length > 0 && file !== ".factory.env");
   }
 
-  private async integrateRequest(integration: ManagerTurnOutput["integrations"][number]): Promise<void> {
+  private async integrateRequest(integration: IntegrationRequest): Promise<void> {
     const task =
       (integration.taskId ? this.db.getTask(integration.taskId) : undefined) ??
       (integration.branch ? this.findTaskByBranch(integration.branch) : undefined);
@@ -1708,7 +2026,7 @@ class FactorySupervisor {
   }
 
   private async handleDeploymentIntent(
-    intent: ManagerTurnOutput["deployments"][number]
+    intent: DeploymentIntent
   ): Promise<void> {
     if (intent.kind === "deploy_preview") {
       const commit = intent.commit ?? (await currentCommit(this.config.repoRoot, this.config.candidateBranch));
@@ -2436,6 +2754,22 @@ class FactorySupervisor {
           return;
         }
 
+        if (request.method === "POST" && url.pathname === "/internal/manager-tool") {
+          const authorization = request.headers.authorization;
+          if (authorization !== `Bearer ${this.managerToolToken}`) {
+            response.writeHead(403, { "content-type": "application/json" });
+            response.end(JSON.stringify({ ok: false, error: "forbidden" }));
+            return;
+          }
+
+          const body = await this.readJsonRequestBody(request);
+          const toolRequest = this.parseManagerToolHttpRequest(body);
+          const result = await this.executeManagerToolCall(toolRequest);
+          response.writeHead(result.ok ? 200 : 400, { "content-type": "application/json" });
+          response.end(JSON.stringify(result));
+          return;
+        }
+
         response.writeHead(404, { "content-type": "application/json" });
         response.end(JSON.stringify({ error: "not_found" }));
       } catch (error) {
@@ -2467,16 +2801,7 @@ class FactorySupervisor {
       return;
     }
 
-    const body = await new Promise<string>((resolve, reject) => {
-      let chunks = "";
-      request.setEncoding("utf8");
-      request.on("data", (chunk) => {
-        chunks += chunk;
-      });
-      request.on("end", () => resolve(chunks));
-      request.on("error", reject);
-    });
-    const update = JSON.parse(body) as Record<string, unknown>;
+    const update = await this.readJsonRequestBody(request);
     const message = update.message as
       | { message_id?: number; text?: string; chat?: { id?: string | number; type?: string }; from?: { id?: string | number } }
       | undefined;

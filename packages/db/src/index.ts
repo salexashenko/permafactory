@@ -8,6 +8,8 @@ import type {
   DecisionRequest,
   FactoryProjectConfig,
   InboxItem,
+  ManagerToolCallRecord,
+  ManagerToolName,
   ManagerTurnInput,
   ProjectRecord,
   TaskContract,
@@ -232,14 +234,34 @@ export class FactoryDatabase {
       CREATE TABLE IF NOT EXISTS manager_turns (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        turn_id TEXT,
         at TEXT NOT NULL,
         summary TEXT NOT NULL,
         wake_reasons_json TEXT NOT NULL DEFAULT '[]',
         action_counts_json TEXT NOT NULL DEFAULT '{}',
         action_preview_json TEXT NOT NULL DEFAULT '{}',
         mismatch_hints_json TEXT NOT NULL DEFAULT '[]',
+        tool_calls_json TEXT NOT NULL DEFAULT '[]',
         raw_output_json TEXT NOT NULL DEFAULT '{}'
       );
+
+      CREATE TABLE IF NOT EXISTS manager_tool_calls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        thread_id TEXT,
+        turn_id TEXT,
+        request_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        args_json TEXT NOT NULL DEFAULT '{}',
+        result_json TEXT NOT NULL DEFAULT '{}',
+        error_text TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_manager_tool_calls_request
+        ON manager_tool_calls(project_id, request_id, tool_name);
 
       CREATE TABLE IF NOT EXISTS health_samples (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -268,8 +290,10 @@ export class FactoryDatabase {
       );
     `);
 
+    this.ensureColumn("manager_turns", "turn_id", "TEXT");
     this.ensureColumn("manager_turns", "action_preview_json", "TEXT NOT NULL DEFAULT '{}'");
     this.ensureColumn("manager_turns", "mismatch_hints_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn("manager_turns", "tool_calls_json", "TEXT NOT NULL DEFAULT '[]'");
     this.ensureColumn("manager_turns", "raw_output_json", "TEXT NOT NULL DEFAULT '{}'");
   }
 
@@ -519,25 +543,29 @@ export class FactoryDatabase {
 
   insertManagerTurn(options: {
     projectId: string;
+    turnId?: string;
     summary: string;
     wakeReasons: string[];
     actionCounts: ManagerTurnInput["recentManagerTurns"][number]["actionCounts"];
     actionPreview: ManagerTurnInput["recentManagerTurns"][number]["actionPreview"];
     mismatchHints: string[];
+    toolCalls: string[];
     rawOutput: Record<string, unknown>;
   }): void {
     this.db
       .prepare(
-        "INSERT INTO manager_turns (project_id, at, summary, wake_reasons_json, action_counts_json, action_preview_json, mismatch_hints_json, raw_output_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO manager_turns (project_id, turn_id, at, summary, wake_reasons_json, action_counts_json, action_preview_json, mismatch_hints_json, tool_calls_json, raw_output_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
       )
       .run(
         options.projectId,
+        options.turnId ?? null,
         nowIso(),
         options.summary,
         serializeJson(options.wakeReasons),
         serializeJson(options.actionCounts),
         serializeJson(options.actionPreview),
         serializeJson(options.mismatchHints),
+        serializeJson(options.toolCalls),
         serializeJson(options.rawOutput)
       );
   }
@@ -550,7 +578,7 @@ export class FactoryDatabase {
       .prepare(
         `
           SELECT at, summary, wake_reasons_json, action_counts_json
-               , action_preview_json, mismatch_hints_json, raw_output_json
+               , action_preview_json, mismatch_hints_json, tool_calls_json, raw_output_json
           FROM manager_turns
           WHERE project_id = ?
           ORDER BY at DESC
@@ -588,8 +616,109 @@ export class FactoryDatabase {
         }
       ),
       mismatchHints: parseJson<string[]>(row.mismatch_hints_json, []),
+      toolCalls: parseJson<string[]>(row.tool_calls_json, []),
       rawOutput: parseJson<Record<string, unknown>>(row.raw_output_json, {})
     }));
+  }
+
+  getManagerToolCall(
+    projectId: string,
+    requestId: string,
+    toolName: ManagerToolName
+  ): ManagerToolCallRecord | undefined {
+    const row = this.db
+      .prepare(
+        `
+          SELECT request_id, thread_id, turn_id, tool_name, status, args_json, result_json,
+                 error_text, created_at, updated_at
+          FROM manager_tool_calls
+          WHERE project_id = ? AND request_id = ? AND tool_name = ?
+          LIMIT 1
+        `
+      )
+      .get(projectId, requestId, toolName) as Record<string, unknown> | undefined;
+    return row ? this.managerToolCallFromRow(row) : undefined;
+  }
+
+  recordManagerToolCallStart(options: {
+    projectId: string;
+    threadId?: string;
+    turnId?: string;
+    requestId: string;
+    toolName: ManagerToolName;
+    args: Record<string, unknown>;
+  }): ManagerToolCallRecord {
+    const now = nowIso();
+    this.db
+      .prepare(
+        `
+          INSERT OR IGNORE INTO manager_tool_calls (
+            project_id, thread_id, turn_id, request_id, tool_name, status, args_json, result_json,
+            error_text, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, 'running', ?, '{}', NULL, ?, ?)
+        `
+      )
+      .run(
+        options.projectId,
+        options.threadId ?? null,
+        options.turnId ?? null,
+        options.requestId,
+        options.toolName,
+        serializeJson(options.args),
+        now,
+        now
+      );
+
+    const existing = this.getManagerToolCall(options.projectId, options.requestId, options.toolName);
+    if (!existing) {
+      throw new Error(`Failed to record manager tool call ${options.toolName}`);
+    }
+    return existing;
+  }
+
+  finishManagerToolCall(options: {
+    projectId: string;
+    requestId: string;
+    toolName: ManagerToolName;
+    status: "completed" | "failed";
+    result?: Record<string, unknown>;
+    errorText?: string;
+  }): void {
+    this.db
+      .prepare(
+        `
+          UPDATE manager_tool_calls
+          SET status = ?, result_json = ?, error_text = ?, updated_at = ?
+          WHERE project_id = ? AND request_id = ? AND tool_name = ?
+        `
+      )
+      .run(
+        options.status,
+        serializeJson(options.result ?? {}),
+        options.errorText ?? null,
+        nowIso(),
+        options.projectId,
+        options.requestId,
+        options.toolName
+      );
+  }
+
+  listManagerToolCallsByTurn(
+    projectId: string,
+    turnId: string
+  ): ManagerToolCallRecord[] {
+    const rows = this.db
+      .prepare(
+        `
+          SELECT request_id, thread_id, turn_id, tool_name, status, args_json, result_json,
+                 error_text, created_at, updated_at
+          FROM manager_tool_calls
+          WHERE project_id = ? AND turn_id = ?
+          ORDER BY created_at ASC
+        `
+      )
+      .all(projectId, turnId) as Record<string, unknown>[];
+    return rows.map((row) => this.managerToolCallFromRow(row));
   }
 
   upsertAgent(agent: Omit<AgentRecord, "updatedAt">): void {
@@ -1226,9 +1355,13 @@ export class FactoryDatabase {
           source: "telegram" as const,
           receivedAt: item.receivedAt,
           text: item.text,
-          urgent: true
+          urgent: true,
+          replyToMessageId: item.externalId
         })),
-      inboxItems: this.listInboxItems(config.projectId),
+      inboxItems: this.listInboxItems(config.projectId).map((item) => ({
+        ...item,
+        externalId: item.externalId
+      })),
       agents: this.listAgents(config.projectId)
         .filter((agent) => ["idle", "running", "stalled", "failed"].includes(agent.status))
         .map((agent) => ({
@@ -1310,6 +1443,21 @@ export class FactoryDatabase {
         ? parseJson<TaskContract>(row.contract_json, undefined as never)
         : undefined,
       blockedByDecisionIds: parseJson<string[]>(row.blocked_by_decision_ids_json, []),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at)
+    };
+  }
+
+  private managerToolCallFromRow(row: Record<string, unknown>): ManagerToolCallRecord {
+    return {
+      requestId: String(row.request_id),
+      threadId: row.thread_id ? String(row.thread_id) : undefined,
+      turnId: row.turn_id ? String(row.turn_id) : undefined,
+      toolName: row.tool_name as ManagerToolName,
+      status: row.status as ManagerToolCallRecord["status"],
+      args: parseJson<Record<string, unknown>>(row.args_json, {}),
+      result: parseJson<Record<string, unknown>>(row.result_json, {}),
+      errorText: row.error_text ? String(row.error_text) : undefined,
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at)
     };

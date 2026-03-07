@@ -22,11 +22,13 @@ import { execFile } from "node:child_process";
 import type {
   DecisionRequest,
   DecisionBudgetSnapshot,
+  DeploymentIntent,
   FactoryProjectConfig,
   ManagerTurnOutput,
   PortLeaseRequirement,
   ReasoningEffort,
   TaskContract,
+  TelegramOutboundKind,
   WorkerSandboxCapabilities
 } from "@permafactory/models";
 
@@ -527,7 +529,7 @@ function booleanValue(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
-function normalizeTelegramKind(value: unknown): ManagerTurnOutput["userMessages"][number]["kind"] {
+function normalizeTelegramKind(value: unknown): TelegramOutboundKind {
   switch (firstString(value)?.toLowerCase()) {
     case "decision_required":
     case "decision":
@@ -595,7 +597,7 @@ function normalizeReasoningEffort(value: unknown, title: string, goal: string): 
     : "medium";
 }
 
-function normalizeDeploymentKind(value: unknown): ManagerTurnOutput["deployments"][number]["kind"] | undefined {
+function normalizeDeploymentKind(value: unknown): DeploymentIntent["kind"] | undefined {
   switch (firstString(value)?.toLowerCase()) {
     case "deploy_preview":
     case "preview":
@@ -663,320 +665,34 @@ export function normalizeManagerTurnOutput(
     throw new Error("Manager output must be a JSON object");
   }
 
-  const createId = options.createId ?? randomId;
-  const now = options.now ?? nowIso();
-  const userMessages = Array.isArray(object.userMessages)
-    ? object.userMessages
-        .map((entry) => {
-          if (typeof entry === "string") {
-            return {
-              kind: "info_update" as const,
-              text: entry
-            };
-          }
+  void options;
 
-          const message = asRecord(entry);
-          if (!message) {
-            return undefined;
-          }
+  const forbiddenKeys = [
+    "userMessages",
+    "tasksToStart",
+    "tasksToCancel",
+    "reviewsToStart",
+    "integrations",
+    "deployments",
+    "decisions"
+  ].filter((key) => key in object);
+  if (forbiddenKeys.length > 0) {
+    throw new Error(
+      `Manager output must not include side-effect fields (${forbiddenKeys.join(", ")}); use MCP tools instead`
+    );
+  }
 
-          const text = firstString(message.text, message.message, message.content, message.summary);
-          if (!text) {
-            return undefined;
-          }
-
-          return {
-            kind: normalizeTelegramKind(message.kind ?? message.type),
-            text,
-            ...(firstString(message.replyToMessageId, message.reply_to_message_id, message.replyTo)
-              ? { replyToMessageId: firstString(message.replyToMessageId, message.reply_to_message_id, message.replyTo) }
-              : {}),
-            ...(firstString(message.decisionId, message.decision_id)
-              ? { decisionId: firstString(message.decisionId, message.decision_id) }
-              : {})
-          };
-        })
-        .filter((entry): entry is ManagerTurnOutput["userMessages"][number] => Boolean(entry))
-    : [];
-
-  const tasksToStart = Array.isArray(object.tasksToStart)
-    ? object.tasksToStart
-        .map((entry) => {
-          const task = asRecord(entry);
-          if (!task) {
-            return undefined;
-          }
-
-          const title = firstString(task.title, task.summary, task.name, task.task) ?? "Untitled task";
-          const goal = firstString(task.goal, task.description, task.objective, title) ?? title;
-          const id = firstString(task.id) ?? createId("task");
-          const kind = normalizeTaskKind(task.kind ?? task.type);
-          const runtime = asRecord(task.runtime);
-          const constraints = asRecord(task.constraints);
-          const context = asRecord(task.context);
-          const ports = asRecord(task.ports);
-          const mustRunChecks = stringArray(
-            constraints?.mustRunChecks ?? task.mustRunChecks ?? task.checks
-          );
-          const files = stringArray(constraints?.files ?? task.files);
-          const doNotTouch = stringArray(constraints?.doNotTouch ?? task.doNotTouch);
-          const acceptanceCriteria = stringArray(
-            task.acceptanceCriteria ?? task.acceptance ?? task.criteria ?? task.doneWhen
-          );
-          const branchName =
-            firstString(task.branchName, task.branch, task.branch_name) ?? `agent/${slugify(title || id)}`;
-
-          return {
-            id,
-            kind,
-            title,
-            goal,
-            acceptanceCriteria:
-              acceptanceCriteria.length > 0 ? acceptanceCriteria : defaultAcceptanceCriteria(kind, goal),
-            baseBranch: firstString(task.baseBranch, task.base, task.base_branch) ?? options.candidateBranch,
-            branchName,
-            worktreePath:
-              firstString(task.worktreePath, task.worktree, task.worktree_path) ??
-              path.join(options.worktreesDir, id),
-            lockScope: (() => {
-              const explicit = stringArray(task.lockScope);
-              if (explicit.length > 0) {
-                return explicit;
-              }
-              if (files.length > 0) {
-                return files;
-              }
-              return ["repo"];
-            })(),
-            needsPreview:
-              booleanValue(task.needsPreview) ?? inferNeedsPreview(kind, title, goal, mustRunChecks),
-            ports: {
-              ...(numberValue(ports?.app ?? task.appPort) !== undefined
-                ? { app: numberValue(ports?.app ?? task.appPort) }
-                : {}),
-              ...(numberValue(ports?.e2e ?? task.e2ePort) !== undefined
-                ? { e2e: numberValue(ports?.e2e ?? task.e2ePort) }
-                : {})
-            },
-            runtime: {
-              maxRuntimeMinutes:
-                numberValue(runtime?.maxRuntimeMinutes ?? task.maxRuntimeMinutes) ??
-                (kind === "test" ? 25 : kind === "maintenance" ? 20 : 45),
-              reasoningEffort: normalizeReasoningEffort(
-                runtime?.reasoningEffort ?? task.reasoningEffort,
-                title,
-                goal
-              )
-            },
-            constraints: {
-              ...(files.length > 0 ? { files } : {}),
-              ...(doNotTouch.length > 0 ? { doNotTouch } : {}),
-              mustRunChecks
-            },
-            context: {
-              userIntent: firstString(context?.userIntent, task.userIntent, goal) ?? goal,
-              relatedTaskIds: stringArray(
-                context?.relatedTaskIds ?? task.relatedTaskIds ?? task.relatedTasks ?? task.dependsOn
-              ),
-              blockingDecisions: stringArray(context?.blockingDecisions ?? task.blockingDecisions)
-            }
-          } satisfies TaskContract;
-        })
-        .filter((entry): entry is TaskContract => Boolean(entry))
-    : [];
-
-  const tasksToCancel = Array.isArray(object.tasksToCancel)
-    ? object.tasksToCancel
-        .map((entry) => (typeof entry === "string" ? entry : firstString(asRecord(entry)?.id)))
-        .filter((entry): entry is string => Boolean(entry))
-    : [];
-
-  const reviewsToStart = Array.isArray(object.reviewsToStart)
-    ? object.reviewsToStart
-        .map((entry) => {
-          const review = asRecord(entry);
-          if (!review) {
-            return undefined;
-          }
-
-          const taskId = firstString(review.taskId, review.task_id);
-          const branch = firstString(review.branch, review.branchName);
-          const baseBranch = firstString(review.baseBranch, review.base_branch) ?? options.candidateBranch;
-          const reason = firstString(review.reason, review.summary, review.goal);
-          if (!branch || !reason) {
-            return undefined;
-          }
-
-          return {
-            branch,
-            baseBranch,
-            reason,
-            ...(taskId ? { taskId } : {}),
-            ...(firstString(review.worktreePath, review.worktree, review.worktree_path)
-              ? { worktreePath: firstString(review.worktreePath, review.worktree, review.worktree_path) }
-              : {}),
-            ...(firstString(review.commit, review.sha) ? { commit: firstString(review.commit, review.sha) } : {})
-          };
-        })
-        .filter((entry): entry is ManagerTurnOutput["reviewsToStart"][number] => Boolean(entry))
-    : [];
-
-  const rawIntegrations: unknown[] = Array.isArray(
-    object.integrations ?? object.merges ?? object.integrationsToApply
-  )
-    ? ((object.integrations ?? object.merges ?? object.integrationsToApply) as unknown[])
-    : [];
-
-  const integrations = rawIntegrations
-        .map((entry: unknown) => {
-          const integration = asRecord(entry);
-          if (!integration) {
-            return undefined;
-          }
-
-          const taskId = firstString(integration.taskId, integration.task_id);
-          const branch = firstString(integration.branch, integration.branchName);
-          const reason = firstString(integration.reason, integration.summary, integration.goal);
-          if ((!taskId && !branch) || !reason) {
-            return undefined;
-          }
-
-          return {
-            ...(taskId ? { taskId } : {}),
-            ...(branch ? { branch } : {}),
-            ...(firstString(integration.targetBranch, integration.target, integration.baseBranch, integration.base_branch)
-              ? {
-                  targetBranch: firstString(
-                    integration.targetBranch,
-                    integration.target,
-                    integration.baseBranch,
-                    integration.base_branch
-                  )
-                }
-              : {}),
-            reason,
-            ...(firstString(integration.worktreePath, integration.worktree, integration.worktree_path)
-              ? { worktreePath: firstString(integration.worktreePath, integration.worktree, integration.worktree_path) }
-              : {}),
-            ...(firstString(integration.commit, integration.sha) ? { commit: firstString(integration.commit, integration.sha) } : {})
-          };
-        })
-        .filter((entry: ManagerTurnOutput["integrations"][number] | undefined): entry is ManagerTurnOutput["integrations"][number] => Boolean(entry))
-    ;
-
-  const deployments = Array.isArray(object.deployments)
-    ? object.deployments
-        .map((entry) => {
-          const deployment = typeof entry === "string" ? { kind: entry } : asRecord(entry);
-          if (!deployment) {
-            return undefined;
-          }
-
-          const kind = normalizeDeploymentKind(deployment.kind ?? deployment.action ?? deployment.type);
-          if (!kind) {
-            return undefined;
-          }
-
-          return {
-            kind,
-            reason:
-              firstString(deployment.reason, deployment.summary, deployment.title) ??
-              `Manager requested ${kind}.`,
-            ...(firstString(deployment.commit, deployment.sha) ? { commit: firstString(deployment.commit, deployment.sha) } : {}),
-            ...(firstString(deployment.rollbackTag, deployment.tag)
-              ? { rollbackTag: firstString(deployment.rollbackTag, deployment.tag) }
-              : {})
-          };
-        })
-        .filter((entry): entry is ManagerTurnOutput["deployments"][number] => Boolean(entry))
-    : [];
-
-  const decisions = Array.isArray(object.decisions)
-    ? object.decisions
-        .map((entry) => {
-          const decision = asRecord(entry);
-          if (!decision) {
-            return undefined;
-          }
-
-          const title = firstString(decision.title, decision.question);
-          if (!title) {
-            return undefined;
-          }
-
-          const options = Array.isArray(decision.options)
-            ? decision.options
-                .map((option, index) => {
-                  if (typeof option === "string") {
-                    return {
-                      id: `option_${index + 1}`,
-                      label: option,
-                      consequence: option
-                    };
-                  }
-
-                  const item = asRecord(option);
-                  const label = firstString(item?.label, item?.title, item?.text);
-                  if (!item || !label) {
-                    return undefined;
-                  }
-
-                  return {
-                    id: firstString(item.id) ?? `option_${index + 1}`,
-                    label,
-                    consequence: firstString(item.consequence, item.summary, label) ?? label
-                  };
-                })
-                .filter((option): option is DecisionRequest["options"][number] => Boolean(option))
-            : [];
-
-          if (options.length < 2) {
-            return undefined;
-          }
-
-          const firstOption = options[0];
-          if (!firstOption) {
-            return undefined;
-          }
-
-          const defaultOptionId =
-            firstString(decision.defaultOptionId, decision.defaultOption, decision.default) ?? firstOption.id;
-
-          return {
-            id: firstString(decision.id) ?? createId("decision"),
-            title,
-            reason: firstString(decision.reason, decision.context, decision.why, title) ?? title,
-            priority: normalizeDecisionPriority(decision.priority),
-            dedupeKey:
-              firstString(decision.dedupeKey) ??
-              computeDecisionDedupeKey(title, options.map((option) => option.label), title),
-            options,
-            defaultOptionId: options.some((option) => option.id === defaultOptionId)
-              ? defaultOptionId
-              : firstOption.id,
-            expiresAt:
-              firstString(decision.expiresAt) ??
-              new Date(Date.parse(now) + 4 * 60 * 60 * 1000).toISOString(),
-            impactSummary:
-              firstString(decision.impactSummary, decision.impact, decision.reason, title) ?? title,
-            budgetCost: 1 as const
-          } satisfies DecisionRequest;
-        })
-        .filter((entry): entry is DecisionRequest => Boolean(entry))
-    : [];
-
-  const assumptions = stringArray(object.assumptions);
+  const allowedKeys = new Set(["summary", "assumptions", "defaults", "message", "title", "status"]);
+  const unexpectedKeys = Object.keys(object).filter((key) => !allowedKeys.has(key));
+  if (unexpectedKeys.length > 0) {
+    throw new Error(
+      `Manager output must contain only summary and assumptions; unexpected fields: ${unexpectedKeys.join(", ")}`
+    );
+  }
 
   return {
-    summary: firstString(object.summary, object.message, object.title) ?? "Manager turn update",
-    userMessages,
-    tasksToStart,
-    tasksToCancel,
-    reviewsToStart,
-    integrations,
-    deployments,
-    decisions,
-    assumptions
+    summary: firstString(object.summary, object.message, object.title, object.status) ?? "Manager turn update",
+    assumptions: stringArray(object.assumptions ?? object.defaults)
   };
 }
 

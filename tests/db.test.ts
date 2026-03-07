@@ -287,6 +287,7 @@ test("getManagerInput exposes recent manager turns", async () => {
         userMessages: []
       },
       mismatchHints: ["summary_mentions_review_without_review_action"],
+      toolCalls: [],
       rawOutput: {
         summary: "Queued a branch review",
         reviewsToStart: [{ branch: "task/bootstrap", baseBranch: "candidate", reason: "Review it" }]
@@ -299,6 +300,91 @@ test("getManagerInput exposes recent manager turns", async () => {
     assert.equal(input.recentManagerTurns[0]?.actionCounts.reviewsToStart, 1);
     assert.deepEqual(input.recentManagerTurns[0]?.actionPreview.reviewsToStart, ["task/bootstrap->candidate"]);
     assert.deepEqual(input.recentManagerTurns[0]?.mismatchHints, ["summary_mentions_review_without_review_action"]);
+    assert.deepEqual(input.recentManagerTurns[0]?.toolCalls, []);
     assert.equal(input.recentManagerTurns[0]?.rawOutput?.summary, "Queued a branch review");
+  });
+});
+
+test("manager tool calls persist and recent manager turns expose tool traces", async () => {
+  await withDb((db, config) => {
+    db.recordManagerToolCallStart({
+      projectId: config.projectId,
+      threadId: "thread_1",
+      turnId: "turn_1",
+      requestId: "req_1",
+      toolName: "start_task",
+      args: {
+        id: "task_bootstrap",
+        branchName: "task/bootstrap"
+      }
+    });
+    db.finishManagerToolCall({
+      projectId: config.projectId,
+      requestId: "req_1",
+      toolName: "start_task",
+      status: "completed",
+      result: {
+        taskId: "task_bootstrap",
+        status: "queued"
+      }
+    });
+
+    db.insertManagerTurn({
+      projectId: config.projectId,
+      turnId: "turn_1",
+      summary: "Started bootstrap work",
+      wakeReasons: ["startup"],
+      actionCounts: {
+        tasksToStart: 1,
+        tasksToCancel: 0,
+        reviewsToStart: 0,
+        integrations: 0,
+        deployments: 0,
+        decisions: 0,
+        userMessages: 0
+      },
+      actionPreview: {
+        tasksToStart: ["task_bootstrap:task/bootstrap"],
+        tasksToCancel: [],
+        reviewsToStart: [],
+        integrations: [],
+        deployments: [],
+        decisions: [],
+        userMessages: []
+      },
+      mismatchHints: [],
+      toolCalls: ["completed:start_task:task_bootstrap:task/bootstrap"],
+      rawOutput: {
+        summary: "Started bootstrap work"
+      }
+    });
+
+    const toolCalls = db.listManagerToolCallsByTurn(config.projectId, "turn_1");
+    assert.equal(toolCalls.length, 1);
+    assert.equal(toolCalls[0]?.toolName, "start_task");
+    assert.equal(toolCalls[0]?.status, "completed");
+
+    const recentTurns = db.listRecentManagerTurns(config.projectId, 1);
+    assert.deepEqual(recentTurns[0]?.toolCalls, [
+      "completed:start_task:task_bootstrap:task/bootstrap"
+    ]);
+  });
+});
+
+test("getManagerInput surfaces reply threading metadata for Telegram messages", async () => {
+  await withDb((db, config) => {
+    db.insertInboxItem({
+      id: "inbox_1",
+      projectId: config.projectId,
+      source: "telegram",
+      externalId: "101",
+      receivedAt: "2026-03-07T00:00:00.000Z",
+      text: "What shipped?",
+      status: "new"
+    });
+
+    const input = db.getManagerInput(config);
+    assert.equal(input.userMessages[0]?.replyToMessageId, "101");
+    assert.equal(input.inboxItems[0]?.externalId, "101");
   });
 });

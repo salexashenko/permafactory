@@ -234,13 +234,6 @@ test("manager output schema accepts a minimal valid payload", async () => {
   const schemaPath = path.resolve("schemas/manager-output.schema.json");
   const output: ManagerTurnOutput = {
     summary: "No-op turn",
-    userMessages: [],
-    tasksToStart: [],
-    tasksToCancel: [],
-    reviewsToStart: [],
-    integrations: [],
-    deployments: [],
-    decisions: [],
     assumptions: []
   };
 
@@ -248,17 +241,15 @@ test("manager output schema accepts a minimal valid payload", async () => {
   assert.equal(result.valid, true);
 });
 
-test("manager output schema rejects malformed tasks", async () => {
+test("manager output schema rejects legacy side-effect fields", async () => {
   const schemaPath = path.resolve("schemas/manager-output.schema.json");
   const malformed = {
     summary: "Bad output",
-    userMessages: [],
-    tasksToStart: [{ id: "x" }] satisfies Partial<TaskContract>[],
-    tasksToCancel: [],
-    reviewsToStart: [],
-    integrations: [],
-    deployments: [],
-    decisions: [],
+    tasksToStart: [
+      {
+        id: "x"
+      }
+    ],
     assumptions: []
   };
 
@@ -266,60 +257,11 @@ test("manager output schema rejects malformed tasks", async () => {
   assert.equal(result.valid, false);
 });
 
-test("manager output schema accepts branch-first review and integration actions", async () => {
-  const schemaPath = path.resolve("schemas/manager-output.schema.json");
-  const output = {
-    summary: "Advance the repaired branch",
-    userMessages: [],
-    tasksToStart: [],
-    tasksToCancel: [],
-    reviewsToStart: [
-      {
-        branch: "task/bootstrap-greenfield",
-        baseBranch: "candidate",
-        reason: "Review the repaired branch state before candidate integration."
-      }
-    ],
-    integrations: [
-      {
-        branch: "task/bootstrap-greenfield",
-        targetBranch: "candidate",
-        reason: "Fast-forward the repaired bootstrap branch into candidate."
-      }
-    ],
-    deployments: [],
-    decisions: [],
-    assumptions: []
-  };
-
-  const result = await validateWithSchema<ManagerTurnOutput>(schemaPath, output);
-  assert.equal(result.valid, true);
-});
-
-test("normalizeManagerTurnOutput materializes planner-friendly manager output", async () => {
+test("normalizeManagerTurnOutput keeps only summary and assumptions", async () => {
   const schemaPath = path.resolve("schemas/manager-output.schema.json");
   const normalized = normalizeManagerTurnOutput(
     {
       summary: "Bootstrap the repo",
-      userMessages: [{ kind: "reply", message: "I am baselining the calculator app." }],
-      tasksToStart: [
-        {
-          kind: "feature",
-          title: "Baseline the calculator app",
-          goal: "Verify build, test, and preview workflows for the calculator web app.",
-          acceptance: ["Build passes", "Tests pass"],
-          checks: ["npm run build", "npm test", "npm run smoke"]
-        }
-      ],
-      reviewsToStart: [
-        {
-          branch: "task_fixed_branch",
-          baseBranch: "candidate",
-          reason: "Review the repaired branch before merge."
-        }
-      ],
-      integrations: [{ branch: "task_fixed_branch", reason: "Fast-forward the approved slice into candidate." }],
-      deployments: [{ action: "preview", summary: "Refresh preview after baseline checks." }],
       assumptions: ["Use candidate as the default base branch."]
     },
     {
@@ -330,14 +272,26 @@ test("normalizeManagerTurnOutput materializes planner-friendly manager output", 
     }
   );
 
-  assert.equal(normalized.userMessages[0]?.kind, "info_update");
-  assert.equal(normalized.tasksToStart[0]?.id, "task_fixed");
-  assert.equal(normalized.tasksToStart[0]?.branchName, "agent/baseline-the-calculator-app");
-  assert.equal(normalized.tasksToStart[0]?.worktreePath, "/tmp/demo/.factory/worktrees/task_fixed");
-  assert.equal(normalized.reviewsToStart[0]?.branch, "task_fixed_branch");
-  assert.equal(normalized.integrations[0]?.branch, "task_fixed_branch");
-  assert.equal(normalized.deployments[0]?.kind, "deploy_preview");
+  assert.equal(normalized.summary, "Bootstrap the repo");
+  assert.deepEqual(normalized.assumptions, ["Use candidate as the default base branch."]);
 
   const result = await validateWithSchema<ManagerTurnOutput>(schemaPath, normalized);
   assert.equal(result.valid, true);
+});
+
+test("normalizeManagerTurnOutput rejects legacy side-effect arrays", () => {
+  assert.throws(
+    () =>
+      normalizeManagerTurnOutput(
+        {
+          summary: "Do work",
+          tasksToStart: [{ id: "task_1" }]
+        },
+        {
+          candidateBranch: "candidate",
+          worktreesDir: "/tmp/demo/.factory/worktrees"
+        }
+      ),
+    /use MCP tools instead/
+  );
 });

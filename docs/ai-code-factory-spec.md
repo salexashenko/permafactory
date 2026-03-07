@@ -366,9 +366,9 @@ Purpose:
 
 - start `factoryd`
 - start the Codex app-server
-- ensure bootstrap tasks are queued if the repo has never been baselined
+- surface current repo/runtime facts so the manager can decide what bootstrap or product work should happen next
 
-If no explicit product task has been ingested yet, the factory must still start and queue discovery/bootstrap work.
+If no explicit product task has been ingested yet, the factory must still start and let the manager decide the next useful work from repo state, spec, backlog, and recent user intent.
 
 ### Bootstrap state machine
 
@@ -386,13 +386,13 @@ State meanings:
 
 - `waiting_for_config`: required bootstrap state is missing, for example the repo has not been initialized with `factoryctl init` yet, `factory.config.ts` does not exist, or required project metadata is incomplete
 - `waiting_for_telegram`: project config exists, but the Telegram control room has not been bound yet
-- `waiting_for_first_task`: Telegram is bound, but no task or inbox item has been ingested yet
-- `baselining_repo`: initial operability and preview-readiness work is in progress
+- `waiting_for_first_task`: Telegram is bound, but there may be no explicit user request yet; this is contextual, not a requirement to idle
+- `baselining_repo`: the repo is still being established; the manager may choose operability, scaffolding, adoption cleanup, or product work as appropriate
 - `active`: bootstrap is complete and normal task scheduling may proceed
 - `paused`: scheduling is intentionally suspended
 - `error`: the project needs operator attention before normal automation can continue
 
-`factoryctl init` normally moves a project from `waiting_for_config` to `waiting_for_telegram`. If required configuration later goes missing or becomes invalid, `factoryd` may demote the project back to `waiting_for_config`.
+`factoryctl init` normally moves a project from `waiting_for_config` to `waiting_for_telegram`. After Telegram is bound, new projects should normally enter `baselining_repo` directly rather than waiting for a ceremonial first task. If required configuration later goes missing or becomes invalid, `factoryd` may demote the project back to `waiting_for_config`.
 
 The project becomes `active` only after:
 
@@ -403,19 +403,19 @@ The project becomes `active` only after:
 
 ### First-run baseline tasks
 
-On the first run against a real project, the manager must not jump straight into feature work. It must first make the project operable.
+On the first run against a real project, the harness should provide repo-shape and runtime facts, and the manager should choose the best first step. That may be operability work, adoption cleanup, scaffolding, or directly building the first product slice.
 
-Mandatory bootstrap work:
+Useful first-run facts and likely concerns:
 
 - confirm or scaffold the canonical project spec path
-- detect and validate install/build/test/start scripts
-- run the project locally in the preview slot
-- establish a healthcheck path or command
+- detect install/build/test/start scripts and whether they are real or placeholders
+- determine whether preview/stable startup is currently meaningful or should be deferred
+- establish a healthcheck path or command when the repo is ready for one
 - map the current repo structure
 - identify missing browser-console action coverage
 - create an onboarding summary for the user
 
-If the repo cannot start successfully, the first active work should be stabilization and operability, not feature delivery.
+If the repo cannot start successfully because it is intentionally greenfield or spec-only, that is not a blocker; the manager may choose to build the first runnable slice instead of spending turns on failed startup attempts.
 
 ### Initial task ingress
 

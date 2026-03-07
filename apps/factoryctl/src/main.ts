@@ -381,7 +381,7 @@ async function handleTelegramConnect(args: string[]): Promise<void> {
           config.telegram.allowedAdminUserIds = [userId, ...config.telegram.allowedAdminUserIds];
         }
       }
-      config.bootstrap.status = "waiting_for_first_task";
+      config.bootstrap.status = "baselining_repo";
       await writeText(getConfigPath(repoRoot), renderFactoryConfig(config));
       db.upsertProject(config);
       db.bindTelegramControlChat(config.projectId, chatId);
