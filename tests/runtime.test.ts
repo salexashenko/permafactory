@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import os from "node:os";
 import path from "node:path";
+import { mkdtemp } from "node:fs/promises";
 import {
   allocatePorts,
   applyWorkerSandboxCapabilities,
@@ -8,10 +10,13 @@ import {
   deriveEffectivePortLeaseRequirement,
   formatHttpUrl,
   isLikelyGreenfieldRepoFiles,
+  loadEnvFile,
   normalizeManagerTurnOutput,
   parseTopLevelBacklogItems,
+  readEnvFileValues,
   selectReachableHost,
   shouldDeliverTelegramNotification,
+  upsertEnvFileValue,
   validateWithSchema
 } from "@permafactory/runtime";
 import type { FactoryProjectConfig, ManagerTurnOutput, TaskContract } from "@permafactory/models";
@@ -294,4 +299,40 @@ test("normalizeManagerTurnOutput rejects legacy side-effect arrays", () => {
       ),
     /use MCP tools instead/
   );
+});
+
+test("upsertEnvFileValue stores secrets without corrupting the env file", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "permafactory-runtime-"));
+  const envPath = path.join(dir, ".env.factory");
+
+  await upsertEnvFileValue(envPath, "OPENAI_API_KEY", "sk-demo");
+  await upsertEnvFileValue(envPath, "JSON_SECRET", '{"a":1}');
+  await upsertEnvFileValue(envPath, "OPENAI_API_KEY", "sk-updated");
+
+  const values = await readEnvFileValues(envPath);
+  assert.deepEqual(values, {
+    OPENAI_API_KEY: "sk-updated",
+    JSON_SECRET: '{"a":1}'
+  });
+});
+
+test("loadEnvFile can override existing values and parse quoted secrets", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "permafactory-runtime-"));
+  const envPath = path.join(dir, ".env.factory");
+
+  await upsertEnvFileValue(envPath, "TEST_FACTORY_SECRET", "from-file");
+  await upsertEnvFileValue(envPath, "TEST_FACTORY_JSON", '{"enabled":true}');
+
+  process.env.TEST_FACTORY_SECRET = "existing";
+  const loadedKeys = await loadEnvFile(envPath, { override: true });
+
+  assert.equal(process.env.TEST_FACTORY_SECRET, "from-file");
+  assert.equal(process.env.TEST_FACTORY_JSON, '{"enabled":true}');
+  assert.deepEqual(
+    new Set(loadedKeys),
+    new Set(["TEST_FACTORY_SECRET", "TEST_FACTORY_JSON"])
+  );
+
+  delete process.env.TEST_FACTORY_SECRET;
+  delete process.env.TEST_FACTORY_JSON;
 });

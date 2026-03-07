@@ -9,3 +9,4 @@ Rules:
 - execute the smallest meaningful set of checks that satisfy the task contract
 - prefer deterministic checks over manual exploration
 - capture artifact paths when they materially help follow-up debugging
+- use the available Chrome DevTools MCP tools when browser-level behavior, console output, or network activity is part of the required validation

@@ -120,6 +120,8 @@ function renderTelegramSetupGuide(config: FactoryProjectConfig): string {
     `8. Run: factoryctl telegram connect --repo ${config.repoRoot} --bot-token-env ${config.telegram.botTokenEnvVar}`,
     "9. Send /hello to the bot in your DM or in the control supergroup to bind it.",
     "10. You do not need to discover the chat id manually; the CLI captures it from /hello.",
+    "11. After the chat is bound, add normal API keys from your phone with /secret KEY value.",
+    "12. Use /secrets to list configured key names. Multiline secrets should still go in .env.factory from the host shell.",
     `More detail: ${path.join(config.repoRoot, config.bootstrap.onboardingSummaryPath)}`
   ].join("\n");
 }
@@ -206,9 +208,9 @@ async function handleStatus(args: string[]): Promise<void> {
   const repoRoot = path.resolve(requireString(parsed.values.repo, "--repo"));
   const { config, db } = await openProject(repoRoot);
   const project = db.getProjectById(config.projectId);
-  const tasks = db.listTasks(config.projectId);
   const agents = db.listAgents(config.projectId);
   const openDecisions = db.listOpenDecisions(config.projectId);
+  const taskActivity = db.getTaskActivitySummary(config.projectId);
   const summary = {
     projectId: config.projectId,
     bootstrapStatus: project.bootstrapStatus,
@@ -216,12 +218,8 @@ async function handleStatus(args: string[]): Promise<void> {
     defaultBranch: config.defaultBranch,
     candidateBranch: config.candidateBranch,
     inboxItems: db.listInboxItems(config.projectId).length,
-    tasks: {
-      queued: tasks.filter((task) => task.status === "queued").length,
-      running: tasks.filter((task) => task.status === "running").length,
-      blocked: tasks.filter((task) => task.status === "blocked").length,
-      review: tasks.filter((task) => task.status === "review").length
-    },
+    tasks: taskActivity.tasks,
+    activeRuns: taskActivity.activeRuns,
     agents: agents.map((agent) => ({
       id: agent.id,
       role: agent.role,
@@ -239,6 +237,9 @@ async function handleStatus(args: string[]): Promise<void> {
     console.log(`Project: ${summary.projectId}`);
     console.log(`Bootstrap: ${summary.bootstrapStatus}`);
     console.log(`Tasks queued/running/blocked/review: ${summary.tasks.queued}/${summary.tasks.running}/${summary.tasks.blocked}/${summary.tasks.review}`);
+    console.log(
+      `Active runs code/review/test: ${summary.activeRuns.code}/${summary.activeRuns.review}/${summary.activeRuns.test}`
+    );
     console.log(`Open decisions: ${summary.openDecisions}`);
     console.log(`Agents: ${summary.agents.map((agent) => `${agent.role}:${agent.status}`).join(", ") || "none"}`);
     console.log(`Active port leases: ${summary.activePortLeases}`);

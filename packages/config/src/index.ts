@@ -218,7 +218,7 @@ export function renderFactoryConfig(config: FactoryProjectConfig): string {
 }
 
 export function renderEnvExample(config: FactoryProjectConfig): string {
-  return `# Copy this file to .env.factory for local CLI use.\n# Create the bot token with @BotFather -> /newbot.\n${config.telegram.botTokenEnvVar}=replace-me\n# Generate with: openssl rand -hex 32\n${config.telegram.webhookSecretEnvVar}=replace-me\n`;
+  return `# Copy this file to .env.factory for local CLI use.\n# Create the bot token with @BotFather -> /newbot.\n${config.telegram.botTokenEnvVar}=replace-me\n# Generate with: openssl rand -hex 32\n${config.telegram.webhookSecretEnvVar}=replace-me\n# After Telegram is connected, you can add normal API keys from your phone with:\n# /secret OPENAI_API_KEY sk-...\n`;
 }
 
 export function renderAgentsStub(projectId: string): string {
@@ -297,6 +297,20 @@ factoryctl telegram connect --repo ${config.repoRoot} --bot-token-env ${config.t
 3. Send \`/hello\` to the bot in your DM or in the control supergroup.
 4. The CLI captures the chat id automatically; you do not need to look it up yourself.
 5. If you already have the public dashboard URL, rerun with \`--webhook-url https://your-host/telegram/webhook\`.
+
+## Adding API Keys From Your Phone
+
+Once the control chat is bound, you can add normal API keys directly from Telegram:
+
+- Send \`/secret OPENAI_API_KEY sk-...\`
+- Or use \`/secret STRIPE_API_KEY=...\`
+- Send \`/secrets\` to list configured key names
+
+Notes:
+
+- This is intended for normal single-line API keys and tokens.
+- For multiline secrets, certificates, or large JSON blobs, edit \`.env.factory\` from the host shell instead.
+- Secret values are not echoed back into manager state; only secret names are exposed for planning.
 
 ## Notes
 

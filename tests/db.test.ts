@@ -218,6 +218,54 @@ test("upsertAgent updates the role when an existing agent id is reused", async (
   });
 });
 
+test("getTaskActivitySummary counts active review runs even when the task is already done", async () => {
+  await withDb((db, config) => {
+    const contract = makeTask("task_reviewing", []);
+
+    db.upsertTask({
+      projectId: config.projectId,
+      id: contract.id,
+      kind: "code",
+      status: "done",
+      title: contract.title,
+      priority: "medium",
+      goal: contract.goal,
+      branchName: contract.branchName,
+      baseBranch: contract.baseBranch,
+      worktreePath: contract.worktreePath,
+      contract,
+      blockedByDecisionIds: []
+    });
+    db.insertRun({
+      id: "run_review_1",
+      projectId: config.projectId,
+      taskId: contract.id,
+      role: "review",
+      attempt: 1,
+      status: "running",
+      runDirectory: path.join(config.repoRoot, ".factory/runs/run_review_1"),
+      jsonlLogPath: path.join(config.repoRoot, ".factory/runs/run_review_1/events.jsonl"),
+      finalMessagePath: path.join(config.repoRoot, ".factory/runs/run_review_1/final.json"),
+      maxRuntimeMinutes: 30,
+      pid: 12345
+    });
+
+    const summary = db.getTaskActivitySummary(config.projectId);
+    assert.deepEqual(summary.tasks, {
+      queued: 0,
+      running: 0,
+      blocked: 0,
+      review: 1
+    });
+    assert.deepEqual(summary.activeRuns, {
+      code: 0,
+      review: 1,
+      test: 0,
+      total: 1
+    });
+  });
+});
+
 test("getManagerInput exposes structured latest task facts and deployment reasons", async () => {
   await withDb((db, config) => {
     const contract = makeTask("task_structured", []);

@@ -52,6 +52,7 @@ import {
   normalizeManagerTurnOutput,
   nowIso,
   randomId,
+  readEnvFileValues,
   readText,
   resolveReachableHttpUrl,
   runCommand,
@@ -61,6 +62,7 @@ import {
   slugify,
   spawnLoggedShellCommand,
   spawnLoggedProcess,
+  upsertEnvFileValue,
   validateWithSchema,
   waitForSuccessfulCommand,
   writeText
@@ -85,6 +87,21 @@ const MANAGER_TOOL_NAMES: ReadonlySet<ManagerToolName> = new Set([
   "apply_deployment",
   "request_decision",
   "reply_user"
+]);
+
+const RESERVED_SECRET_KEYS = new Set([
+  "FACTORY_TASK_ID",
+  "FACTORY_BRANCH",
+  "FACTORY_APP_PORT",
+  "FACTORY_E2E_PORT",
+  "PORT",
+  "HOST",
+  "PATH",
+  "HOME",
+  "PWD",
+  "SHELL",
+  "NODE_OPTIONS",
+  "CODEX_HOME"
 ]);
 
 interface ManagedRuntimeProcess {
@@ -656,6 +673,10 @@ class FactorySupervisor {
             PERMAFACTORY_MANAGER_DASHBOARD_URL: this.dashboardBaseUrl(),
             PERMAFACTORY_MANAGER_TOOL_TOKEN: this.managerToolToken
           }
+        },
+        chrome_devtools: {
+          ...this.buildBrowserMcpServerConfig(),
+          startup_timeout_ms: 20_000
         }
       }
     };
@@ -665,8 +686,49 @@ class FactorySupervisor {
     return `http://127.0.0.1:${this.config.ports.dashboard}`;
   }
 
+  private repoEnvPath(): string {
+    return path.join(this.config.repoRoot, ".env.factory");
+  }
+
+  private async listAvailableSecretKeys(): Promise<string[]> {
+    const values = await readEnvFileValues(this.repoEnvPath());
+    return Object.keys(values)
+      .filter(
+        (key) =>
+          !RESERVED_SECRET_KEYS.has(key) &&
+          !key.startsWith("FACTORY_") &&
+          key !== this.config.telegram.botTokenEnvVar &&
+          key !== this.config.telegram.webhookSecretEnvVar
+      )
+      .sort();
+  }
+
+  private buildBrowserMcpServerConfig(): {
+    command: string;
+    args: string[];
+  } {
+    return {
+      command: path.resolve(this.factoryRepoRoot, "node_modules/.bin/chrome-devtools-mcp"),
+      args: ["--headless", "--isolated", "--no-usage-statistics"]
+    };
+  }
+
+  private buildWorkerMcpConfigArgs(): string[] {
+    const browser = this.buildBrowserMcpServerConfig();
+    const args = [
+      "-c",
+      `mcp_servers.chrome_devtools.command=${JSON.stringify(browser.command)}`,
+      "-c",
+      `mcp_servers.chrome_devtools.args=[${browser.args.map((value) => JSON.stringify(value)).join(",")}]`,
+      "-c",
+      "mcp_servers.chrome_devtools.startup_timeout_ms=20000"
+    ];
+    return args;
+  }
+
   private async buildManagerInput(resources: ManagerTurnInput["resources"]): Promise<ManagerTurnInput> {
     const input = this.db.getManagerInput(this.config);
+    input.project.availableSecretKeys = await this.listAvailableSecretKeys();
     input.repo.dirtyFiles = await listDirtyFiles(this.config.repoRoot);
     input.repo.currentStableCommit = await currentCommit(this.config.repoRoot, this.config.defaultBranch);
     input.repo.currentCandidateCommit = await currentCommit(
@@ -1823,6 +1885,7 @@ class FactorySupervisor {
         this.config.codex.model,
         "--sandbox",
         this.config.codex.sandboxMode,
+        ...this.buildWorkerMcpConfigArgs(),
         "-"
       ],
       {
@@ -2549,16 +2612,19 @@ class FactorySupervisor {
       return;
     }
 
-    const tasks = this.db.listTasks(this.config.projectId);
+    const taskActivity = this.db.getTaskActivitySummary(this.config.projectId);
     const agents = this.db.listAgents(this.config.projectId);
     const openDecisions = this.db.listOpenDecisions(this.config.projectId);
     const deployments = this.db.getDeploymentSnapshot(this.config.projectId);
     const text =
       `Daily digest ${today}\n` +
-      `Tasks queued/running/blocked/review: ${tasks.filter((task) => task.status === "queued").length}/` +
-      `${tasks.filter((task) => task.status === "running").length}/` +
-      `${tasks.filter((task) => task.status === "blocked").length}/` +
-      `${tasks.filter((task) => task.status === "review").length}\n` +
+      `Tasks queued/running/blocked/review: ${taskActivity.tasks.queued}/` +
+      `${taskActivity.tasks.running}/` +
+      `${taskActivity.tasks.blocked}/` +
+      `${taskActivity.tasks.review}\n` +
+      `Active runs code/review/test: ${taskActivity.activeRuns.code}/` +
+      `${taskActivity.activeRuns.review}/` +
+      `${taskActivity.activeRuns.test}\n` +
       `Open decisions: ${openDecisions.length}\n` +
       `Agents running: ${agents.filter((agent) => agent.status === "running").length}\n` +
       `Stable: ${deployments.stable.status} ${deployments.stable.commit.slice(0, 12) || "none"}\n` +
@@ -2822,6 +2888,14 @@ class FactorySupervisor {
         message.chat?.type
       )
     ) {
+      const secretCommand = this.parseSecretCommand(message.text);
+      if (secretCommand) {
+        await this.handleSecretCommand(secretCommand, message.message_id ? String(message.message_id) : undefined);
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
       const inboxId = randomId("inbox");
       this.db.insertInboxItem({
         id: inboxId,
@@ -2899,6 +2973,130 @@ class FactorySupervisor {
 
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({ ok: true }));
+  }
+
+  private parseSecretCommand(
+    text: string
+  ):
+    | { kind: "list" }
+    | { kind: "help" }
+    | { kind: "set"; key: string; value: string }
+    | undefined {
+    const trimmed = text.trim();
+    if (trimmed === "/secrets") {
+      return { kind: "list" };
+    }
+
+    const commandMatch = trimmed.match(/^\/(secret|setsecret)(?:@\w+)?(?:\s+(.+))?$/);
+    if (!commandMatch) {
+      return undefined;
+    }
+
+    const payload = commandMatch[2]?.trim();
+    if (!payload) {
+      return { kind: "help" };
+    }
+
+    const equalsIndex = payload.indexOf("=");
+    const spaceIndex = payload.indexOf(" ");
+    if (equalsIndex > 0 && (spaceIndex === -1 || equalsIndex < spaceIndex)) {
+      const key = payload.slice(0, equalsIndex).trim();
+      const value = payload.slice(equalsIndex + 1).trim();
+      return key && value ? { kind: "set", key, value } : { kind: "help" };
+    }
+
+    const firstSpace = payload.indexOf(" ");
+    if (firstSpace <= 0) {
+      return { kind: "help" };
+    }
+
+    const key = payload.slice(0, firstSpace).trim();
+    const value = payload.slice(firstSpace + 1).trim();
+    return key && value ? { kind: "set", key, value } : { kind: "help" };
+  }
+
+  private async handleSecretCommand(
+    command:
+      | { kind: "list" }
+      | { kind: "help" }
+      | { kind: "set"; key: string; value: string },
+    replyToMessageId?: string
+  ): Promise<void> {
+    if (command.kind === "list") {
+      const keys = await this.listAvailableSecretKeys();
+      const text =
+        keys.length > 0
+          ? `Configured secret keys:\n${keys.map((key) => `- ${key}`).join("\n")}`
+          : "No secret keys are configured yet. Send /secret ENV_NAME value to add one.";
+      await this.sendTelegramMessage(
+        "info_update",
+        text,
+        replyToMessageId,
+        undefined,
+        undefined,
+        { isDirectUserResponse: true }
+      );
+      return;
+    }
+
+    if (command.kind === "help") {
+      await this.sendTelegramMessage(
+        "info_update",
+        "Send secrets as /secret ENV_NAME value. Example: /secret OPENAI_API_KEY sk-...\nUse /secrets to list configured key names. Multiline secrets should be added from the host shell instead of Telegram.",
+        replyToMessageId,
+        undefined,
+        undefined,
+        { isDirectUserResponse: true }
+      );
+      return;
+    }
+
+    const key = command.key.trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      await this.sendTelegramMessage(
+        "info_update",
+        `Refused secret name ${key}. Use a valid environment variable name like OPENAI_API_KEY.`,
+        replyToMessageId,
+        undefined,
+        undefined,
+        { isDirectUserResponse: true }
+      );
+      return;
+    }
+
+    if (RESERVED_SECRET_KEYS.has(key) || key.startsWith("FACTORY_")) {
+      await this.sendTelegramMessage(
+        "info_update",
+        `Refused ${key}. That name is reserved for factory/runtime internals.`,
+        replyToMessageId,
+        undefined,
+        undefined,
+        { isDirectUserResponse: true }
+      );
+      return;
+    }
+
+    await upsertEnvFileValue(this.repoEnvPath(), key, command.value);
+    process.env[key] = command.value;
+    this.db.insertTelegramMessage({
+      id: randomId("telegram"),
+      projectId: this.config.projectId,
+      chatId: this.config.telegram.controlChatId,
+      direction: "inbound",
+      kind: "secret_update",
+      text: `${key}=[redacted]`,
+      replyToMessageId
+    });
+    await this.sendTelegramMessage(
+      "info_update",
+      `Stored ${key}. Future workers, reviews, and deployments can use it without restarting the factory.`,
+      replyToMessageId,
+      undefined,
+      undefined,
+      { isDirectUserResponse: true }
+    );
+    await this.interruptManagerIfRunning();
+    this.pendingManagerWakeReasons.add("secret_updated");
   }
 
   private isTelegramActorAllowed(

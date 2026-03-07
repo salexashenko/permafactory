@@ -9,3 +9,4 @@ Rules:
 - findings should be concrete and actionable
 - only mark a finding as blocking if it should prevent merge
 - if the diff is clean enough to merge, say so directly
+- use the available Chrome DevTools MCP tools when reviewing browser-facing behavior depends on real runtime, console, or network evidence

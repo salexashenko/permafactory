@@ -73,6 +73,8 @@ The final JSON must not contain action arrays or message payloads. If you need s
 - `summary`
 - `assumptions`
 
+Browser tooling is available through the Chrome DevTools MCP server when page behavior, console errors, network failures, screenshots, or real UI state matter.
+
 ## User Abstraction
 
 The user is buying product progress, not internal factory narration.
@@ -238,6 +240,7 @@ Interpret important fields as follows:
 - `userMessages`: newest unhandled human input
 - `project.bootstrapStatus`: whether this project is still onboarding
 - `project.projectSpecPath`: canonical project/product spec location in the target repo
+- `project.availableSecretKeys`: names of configured product or integration secrets currently available to workers and deployments; names only, never values
 - `decisionBudget.remaining`: hard cap for any new decision requests today
 - `decisionBudget.remainingNormal`: how many non-critical decisions you may still spend today
 - `decisionBudget.remainingCriticalReserve`: how much critical reserve remains
@@ -279,6 +282,8 @@ Use `repo.branches[*]` when task bookkeeping is stale, conflicting, or incomplet
 
 Use `deployments.*.reason` and `deployments.*.updatedAt` to understand why a runtime is down and how stale that information is.
 
+Treat `project.availableSecretKeys` as presence-only state. Never restate secret values in summaries. When a missing credential is the real blocker, ask the user to send it in Telegram as `/secret ENV_NAME value`, and mention `/secrets` if listing currently configured key names would help.
+
 Use `deployments.stable.canRollback` and `deployments.stable.rollbackTargetCommit` before requesting rollback. If `canRollback` is false, do not ask for rollback unless you explicitly provide a safe commit or tag yourself.
 
 Treat branch reality as more important than stale task labels. If a task says `failed` but the branch facts show useful reviewed or reviewable work ahead of its base branch, operate on the branch rather than getting stuck on the label.
@@ -314,6 +319,8 @@ Allowed reasons to message the user:
 Do not send Telegram messages for background progress such as preview deploys, review/test status, bootstrap retries, worker failures, or maintenance activity. Those belong in internal state and the daily digest unless they directly answer the user or produce a new stable release.
 
 When you do reply to the user, keep the content product-facing. Do not mention lockfiles, env vars, branches, worktrees, ports, schemas, queue mechanics, or similar internal details unless the user explicitly asked and the answer truly requires it.
+
+Exception: if you genuinely need a missing API key or credential, tell the user exactly which key name to send with `/secret KEY value`. Keep that request concise and do not explain internal secret plumbing unless asked.
 
 Good message properties:
 

@@ -137,21 +137,24 @@ export async function readText(filePath: string): Promise<string> {
   return await readFile(filePath, "utf8");
 }
 
-export async function readJson<T>(filePath: string): Promise<T> {
-  return JSON.parse(await readText(filePath)) as T;
-}
-
-export async function writeJson(filePath: string, value: unknown): Promise<void> {
-  await writeText(filePath, `${JSON.stringify(value, null, 2)}\n`);
-}
-
-export async function loadEnvFile(filePath: string): Promise<string[]> {
-  if (!(await fileExists(filePath))) {
-    return [];
+function parseQuotedEnvValue(value: string): string {
+  if (value.startsWith('"') && value.endsWith('"')) {
+    try {
+      return JSON.parse(value) as string;
+    } catch {
+      return value.slice(1, -1);
+    }
   }
 
-  const content = await readText(filePath);
-  const loadedKeys: string[] = [];
+  if (value.startsWith("'") && value.endsWith("'")) {
+    return value.slice(1, -1);
+  }
+
+  return value;
+}
+
+function parseEnvContent(content: string): Record<string, string> {
+  const values: Record<string, string> = {};
   for (const rawLine of content.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) {
@@ -168,21 +171,94 @@ export async function loadEnvFile(filePath: string): Promise<string[]> {
       continue;
     }
 
-    let value = rawValue ?? "";
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
+    values[key] = parseQuotedEnvValue(rawValue ?? "");
+  }
 
-    if (process.env[key] === undefined) {
+  return values;
+}
+
+function formatEnvValue(value: string): string {
+  if (value.length === 0) {
+    return '""';
+  }
+
+  if (/^[A-Za-z0-9._~:@%/+,\-=]+$/.test(value)) {
+    return value;
+  }
+
+  return JSON.stringify(value);
+}
+
+export async function readJson<T>(filePath: string): Promise<T> {
+  return JSON.parse(await readText(filePath)) as T;
+}
+
+export async function writeJson(filePath: string, value: unknown): Promise<void> {
+  await writeText(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+export async function readEnvFileValues(filePath: string): Promise<Record<string, string>> {
+  if (!(await fileExists(filePath))) {
+    return {};
+  }
+
+  return parseEnvContent(await readText(filePath));
+}
+
+export async function loadEnvFile(
+  filePath: string,
+  options: {
+    override?: boolean;
+  } = {}
+): Promise<string[]> {
+  const values = await readEnvFileValues(filePath);
+  const loadedKeys: string[] = [];
+  for (const [key, value] of Object.entries(values)) {
+    if (options.override || process.env[key] === undefined) {
       process.env[key] = value;
       loadedKeys.push(key);
     }
   }
 
   return loadedKeys;
+}
+
+export async function upsertEnvFileValue(
+  filePath: string,
+  key: string,
+  value: string
+): Promise<void> {
+  const existing = (await fileExists(filePath)) ? await readText(filePath) : "";
+  const lines = existing.length > 0 ? existing.split(/\r?\n/) : [];
+  const rendered = `${key}=${formatEnvValue(value)}`;
+  let updated = false;
+  const nextLines: string[] = [];
+
+  for (const rawLine of lines) {
+    const match = rawLine.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (match?.[1] === key) {
+      if (!updated) {
+        nextLines.push(rendered);
+        updated = true;
+      }
+      continue;
+    }
+
+    nextLines.push(rawLine);
+  }
+
+  if (!updated) {
+    if (nextLines.length > 0 && nextLines[nextLines.length - 1]?.trim() !== "") {
+      nextLines.push("");
+    }
+    nextLines.push(rendered);
+  }
+
+  while (nextLines.length > 0 && nextLines[nextLines.length - 1] === "") {
+    nextLines.pop();
+  }
+
+  await writeText(filePath, `${nextLines.join("\n")}\n`);
 }
 
 export async function runCommand(

@@ -145,6 +145,7 @@ export interface ManagerTurnInput {
     bootstrapStatus: BootstrapStatus;
     projectSpecPath?: string;
     onboardingSummaryPath: string;
+    availableSecretKeys: string[];
   };
   repo: {
     root: string;

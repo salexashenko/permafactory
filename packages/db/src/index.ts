@@ -501,6 +501,107 @@ export class FactoryDatabase {
     return rows.map((row) => this.taskFromRow(row));
   }
 
+  listRuns(
+    projectId: string,
+    statuses?: string[]
+  ): Array<{
+    id: string;
+    projectId: string;
+    taskId: string;
+    role: "code" | "review" | "test";
+    attempt: number;
+    status: string;
+    runDirectory: string;
+    jsonlLogPath: string;
+    finalMessagePath: string;
+    maxRuntimeMinutes: number;
+    pid?: number;
+    startedAt: string;
+    finishedAt?: string;
+  }> {
+    let rows: Record<string, unknown>[];
+    if (statuses && statuses.length > 0) {
+      const placeholders = statuses.map(() => "?").join(", ");
+      rows = this.db
+        .prepare(
+          `
+            SELECT *
+            FROM runs
+            WHERE project_id = ? AND status IN (${placeholders})
+            ORDER BY started_at DESC
+          `
+        )
+        .all(projectId, ...statuses) as Record<string, unknown>[];
+    } else {
+      rows = this.db
+        .prepare("SELECT * FROM runs WHERE project_id = ? ORDER BY started_at DESC")
+        .all(projectId) as Record<string, unknown>[];
+    }
+
+    return rows.map((row) => ({
+      id: String(row.id),
+      projectId: String(row.project_id),
+      taskId: String(row.task_id),
+      role: row.role as "code" | "review" | "test",
+      attempt: Number(row.attempt),
+      status: String(row.status),
+      runDirectory: String(row.run_directory),
+      jsonlLogPath: String(row.jsonl_log_path),
+      finalMessagePath: String(row.final_message_path),
+      maxRuntimeMinutes: Number(row.max_runtime_minutes),
+      pid: typeof row.pid === "number" ? row.pid : undefined,
+      startedAt: String(row.started_at),
+      finishedAt: row.finished_at ? String(row.finished_at) : undefined
+    }));
+  }
+
+  getTaskActivitySummary(projectId: string): {
+    tasks: {
+      queued: number;
+      running: number;
+      blocked: number;
+      review: number;
+    };
+    activeRuns: {
+      code: number;
+      review: number;
+      test: number;
+      total: number;
+    };
+  } {
+    const tasks = this.listTasks(projectId);
+    const activeRuns = this.listRuns(projectId, ["running"]);
+    const activeCodeOrTestTaskIds = new Set(
+      activeRuns
+        .filter((run) => run.role === "code" || run.role === "test")
+        .map((run) => run.taskId)
+    );
+    const activeReviewTaskIds = new Set(
+      activeRuns.filter((run) => run.role === "review").map((run) => run.taskId)
+    );
+
+    return {
+      tasks: {
+        queued: tasks.filter((task) => task.status === "queued").length,
+        running: new Set([
+          ...tasks.filter((task) => task.status === "running").map((task) => task.id),
+          ...activeCodeOrTestTaskIds
+        ]).size,
+        blocked: tasks.filter((task) => task.status === "blocked").length,
+        review: new Set([
+          ...tasks.filter((task) => task.status === "review").map((task) => task.id),
+          ...activeReviewTaskIds
+        ]).size
+      },
+      activeRuns: {
+        code: activeRuns.filter((run) => run.role === "code").length,
+        review: activeRuns.filter((run) => run.role === "review").length,
+        test: activeRuns.filter((run) => run.role === "test").length,
+        total: activeRuns.length
+      }
+    };
+  }
+
   getTask(taskId: string): TaskRecord | undefined {
     const row = this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as
       | Record<string, unknown>
@@ -1324,7 +1425,8 @@ export class FactoryDatabase {
         id: config.projectId,
         bootstrapStatus: project.bootstrapStatus,
         projectSpecPath: project.projectSpecPath,
-        onboardingSummaryPath: project.onboardingSummaryPath
+        onboardingSummaryPath: project.onboardingSummaryPath,
+        availableSecretKeys: []
       },
       repo: {
         root: project.repoRoot,
