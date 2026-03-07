@@ -26,7 +26,8 @@ import type {
   ManagerTurnOutput,
   PortLeaseRequirement,
   ReasoningEffort,
-  TaskContract
+  TaskContract,
+  WorkerSandboxCapabilities
 } from "@permafactory/models";
 
 const execFileAsync = promisify(execFile);
@@ -978,6 +979,34 @@ export function derivePortLeaseRequirement(task: Pick<TaskContract, "kind" | "ne
   return {
     app: needsApp,
     e2e: needsE2e
+  };
+}
+
+export function deriveEffectivePortLeaseRequirement(
+  task: Pick<TaskContract, "kind" | "needsPreview" | "constraints">,
+  capabilities: WorkerSandboxCapabilities
+): PortLeaseRequirement {
+  if (!capabilities.canBindListenSockets) {
+    return { app: false, e2e: false };
+  }
+
+  return derivePortLeaseRequirement(task);
+}
+
+export function applyWorkerSandboxCapabilities(
+  contract: TaskContract,
+  capabilities: WorkerSandboxCapabilities
+): TaskContract {
+  return {
+    ...contract,
+    ports: capabilities.canBindListenSockets ? { ...contract.ports } : {},
+    context: {
+      ...contract.context,
+      runtimeCapabilities: {
+        ...(contract.context.runtimeCapabilities ?? {}),
+        canBindListenSockets: capabilities.canBindListenSockets
+      }
+    }
   };
 }
 

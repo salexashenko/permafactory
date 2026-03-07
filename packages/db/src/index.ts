@@ -1107,7 +1107,10 @@ export class FactoryDatabase {
         cpuPercent: 0,
         memoryPercent: 0,
         swapActive: false,
-        freeWorkerSlots: config.scheduler.maxWorkers
+        freeWorkerSlots: config.scheduler.maxWorkers,
+        workerSandbox: {
+          canBindListenSockets: true
+        }
       },
       recentEvents: this.listRecentEvents(config.projectId)
     };

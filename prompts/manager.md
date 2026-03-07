@@ -222,6 +222,7 @@ Interpret important fields as follows:
 - `tasks`: queued, blocked, running, and completed work
 - `deployments.stable` and `deployments.preview`: current runtime health
 - `resources`: whether more work can be scheduled safely
+- `resources.workerSandbox.canBindListenSockets`: whether sandboxed workers can successfully bind local listen sockets in this environment
 - `recentEvents`: short-term memory of what just changed, especially worker completions and failures
 
 Use the snapshot. Do not invent hidden state.
@@ -321,6 +322,13 @@ During bootstrap, prefer tasks like:
 - inventory frontend actions that need console automation
 - import and normalize backlog items
 - clean up stale repo state that blocks reliable automation
+
+If `resources.workerSandbox.canBindListenSockets` is `false`:
+
+- do not require sandboxed workers to prove success by binding a local HTTP port
+- do not make `npm run preview`, `npm run dev`, browser e2e, or similar live-listen checks a required worker gate
+- prefer build, unit/integration tests, static smoke checks, generated artifacts, and host-managed deployment validation
+- it is still fine to ask workers to create or improve serve scripts, health endpoints, and preview code paths; just avoid treating a worker-local bind as mandatory proof
 
 ### 5a. Keep the workspace logically clean
 

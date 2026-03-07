@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import {
   allocatePorts,
+  applyWorkerSandboxCapabilities,
   computeDecisionBudgetSnapshot,
+  deriveEffectivePortLeaseRequirement,
   formatHttpUrl,
   normalizeManagerTurnOutput,
   parseTopLevelBacklogItems,
@@ -114,6 +116,61 @@ test("computeDecisionBudgetSnapshot preserves critical reserve", () => {
 test("allocatePorts can allocate app-only leases", () => {
   const ports = allocatePorts(config, new Set([3200, 3201, 4200]), { app: true, e2e: false });
   assert.deepEqual(ports, { app: 3202 });
+});
+
+test("deriveEffectivePortLeaseRequirement suppresses worker ports when sandbox cannot bind", () => {
+  const requirement = deriveEffectivePortLeaseRequirement(
+    {
+      kind: "code",
+      needsPreview: true,
+      constraints: {
+        mustRunChecks: ["npm run preview", "npm run smoke"]
+      }
+    },
+    {
+      canBindListenSockets: false
+    }
+  );
+
+  assert.deepEqual(requirement, { app: false, e2e: false });
+});
+
+test("applyWorkerSandboxCapabilities clears unusable worker ports and records the capability", () => {
+  const contract: TaskContract = {
+    id: "task_demo",
+    kind: "code",
+    title: "Bootstrap preview",
+    goal: "Bootstrap preview",
+    acceptanceCriteria: ["Preview command exists"],
+    baseBranch: "candidate",
+    branchName: "task/bootstrap-preview",
+    worktreePath: "/tmp/demo/.factory/worktrees/task_demo",
+    lockScope: ["repo"],
+    needsPreview: true,
+    ports: {
+      app: 3200,
+      e2e: 4200
+    },
+    runtime: {
+      maxRuntimeMinutes: 45,
+      reasoningEffort: "medium"
+    },
+    constraints: {
+      mustRunChecks: ["npm run preview"]
+    },
+    context: {
+      userIntent: "Bootstrap preview",
+      relatedTaskIds: [],
+      blockingDecisions: []
+    }
+  };
+
+  const adapted = applyWorkerSandboxCapabilities(contract, {
+    canBindListenSockets: false
+  });
+
+  assert.deepEqual(adapted.ports, {});
+  assert.equal(adapted.context.runtimeCapabilities?.canBindListenSockets, false);
 });
 
 test("selectReachableHost prefers Tailscale DNS and falls back to LAN IP", () => {

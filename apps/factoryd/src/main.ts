@@ -17,13 +17,15 @@ import type {
   ManagerTurnOutput,
   ReviewerResult,
   TaskContract,
-  TesterResult
+  TesterResult,
+  WorkerSandboxCapabilities
 } from "@permafactory/models";
 import {
   addWorktree,
   allocatePorts,
+  applyWorkerSandboxCapabilities,
   currentCommit,
-  derivePortLeaseRequirement,
+  deriveEffectivePortLeaseRequirement,
   ensureDetachedWorktreeAtRef,
   ensureDir,
   fileExists,
@@ -339,6 +341,7 @@ class FactorySupervisor {
   private pendingManagerWakeReasons = new Set<string>(["startup"]);
   private activeManagerTurnId?: string;
   private activeManagerThreadId?: string;
+  private workerSandboxCapabilities?: WorkerSandboxCapabilities & { sandboxMode: string };
 
   constructor(private config: FactoryProjectConfig, private readonly db: FactoryDatabase) {
     this.paths = getFactoryPaths(this.config.repoRoot);
@@ -377,6 +380,8 @@ class FactorySupervisor {
     this.db.upsertProject(this.config);
     await this.refreshProjectState();
     await this.reconcileRuntimeTargets();
+    await this.reconcileStaleWorkers();
+    const workerSandboxCapabilities = await this.ensureWorkerSandboxCapabilities();
 
     const expiredDecisions = this.db.expireTimedOutDecisions();
     if (expiredDecisions.length > 0) {
@@ -391,7 +396,13 @@ class FactorySupervisor {
     const activeWorkers = agents.filter(
       (agent) => agent.role !== "manager" && agent.status === "running"
     ).length;
-    const resources = await sampleResources(this.config.scheduler.maxWorkers, activeWorkers);
+    const sampledResources = await sampleResources(this.config.scheduler.maxWorkers, activeWorkers);
+    const resources: ManagerTurnInput["resources"] = {
+      ...sampledResources,
+      workerSandbox: {
+        canBindListenSockets: workerSandboxCapabilities.canBindListenSockets
+      }
+    };
     this.db.recordHealthSample(this.config.projectId, resources);
     await this.maybeSendDailyDigest(resources);
 
@@ -565,6 +576,122 @@ class FactorySupervisor {
     return input;
   }
 
+  private async ensureWorkerSandboxCapabilities(): Promise<WorkerSandboxCapabilities> {
+    if (this.workerSandboxCapabilities?.sandboxMode === this.config.codex.sandboxMode) {
+      return this.workerSandboxCapabilities;
+    }
+
+    if (this.config.codex.sandboxMode === "danger-full-access") {
+      this.workerSandboxCapabilities = {
+        canBindListenSockets: true,
+        sandboxMode: this.config.codex.sandboxMode
+      };
+      return this.workerSandboxCapabilities;
+    }
+
+    const sandboxCommand =
+      process.platform === "linux"
+        ? "linux"
+        : process.platform === "darwin"
+          ? "macos"
+          : process.platform === "win32"
+            ? "windows"
+            : undefined;
+
+    if (!sandboxCommand) {
+      this.workerSandboxCapabilities = {
+        canBindListenSockets: true,
+        sandboxMode: this.config.codex.sandboxMode
+      };
+      return this.workerSandboxCapabilities;
+    }
+
+    const probe = await runCommand(
+      "codex",
+      [
+        "sandbox",
+        sandboxCommand,
+        "--full-auto",
+        "node",
+        "-e",
+        "require('node:http').createServer((_,res)=>res.end('ok')).listen(0,'127.0.0.1',()=>{console.log('LISTEN_OK'); process.exit(0);}).on('error',err=>{console.error(err.code || err.message); process.exit(1);})"
+      ],
+      {
+        cwd: this.config.repoRoot,
+        allowNonZeroExit: true
+      }
+    );
+    const canBindListenSockets = probe.exitCode === 0 && /LISTEN_OK/.test(probe.stdout);
+    if (!canBindListenSockets) {
+      const detail = (probe.stderr || probe.stdout).trim() || `exit ${probe.exitCode}`;
+      console.warn(`worker sandbox listen preflight failed: ${detail}`);
+    }
+
+    this.workerSandboxCapabilities = {
+      canBindListenSockets,
+      sandboxMode: this.config.codex.sandboxMode
+    };
+    return this.workerSandboxCapabilities;
+  }
+
+  private async reconcileStaleWorkers(): Promise<void> {
+    let recoveredAny = false;
+    for (const agent of this.db.listAgents(this.config.projectId)) {
+      if (agent.role === "manager" || agent.status !== "running" || !agent.taskId) {
+        continue;
+      }
+
+      if (this.workerChildren.has(agent.taskId)) {
+        continue;
+      }
+
+      if (agent.pid && this.isProcessAlive(agent.pid)) {
+        continue;
+      }
+
+      const task = this.db.getTask(agent.taskId);
+      if (!task?.contract) {
+        continue;
+      }
+
+      const shouldRequeue = agent.role !== "review";
+      this.db.updateTaskStatus(task.id, shouldRequeue ? "queued" : "failed");
+      this.db.insertTaskEvent(
+        task.id,
+        shouldRequeue ? "queued" : "failed",
+        shouldRequeue
+          ? "Task re-queued after worker process was missing during supervisor startup"
+          : "Review worker was missing during supervisor startup"
+      );
+      this.db.upsertAgent({
+        id: agent.id,
+        projectId: agent.projectId,
+        role: agent.role,
+        status: "failed",
+        taskId: agent.taskId,
+        branch: agent.branch,
+        worktreePath: agent.worktreePath,
+        threadId: agent.threadId,
+        turnId: agent.turnId,
+        metadata: agent.metadata
+      });
+      recoveredAny = true;
+    }
+
+    if (recoveredAny) {
+      this.pendingManagerWakeReasons.add("worker_recovered");
+    }
+  }
+
+  private isProcessAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private async applyManagerOutput(
     output: ManagerTurnOutput,
     wakeReasons: string[],
@@ -606,7 +733,7 @@ class FactorySupervisor {
 
     for (const review of output.reviewsToStart) {
       const task = this.db.getTask(review.taskId);
-      if (!task?.contract || task.status !== "review") {
+      if (!task?.contract || !["review", "blocked", "done"].includes(task.status)) {
         continue;
       }
       if (
@@ -823,6 +950,7 @@ class FactorySupervisor {
     contract: TaskContract,
     role: "code" | "review" | "test"
   ): Promise<void> {
+    const workerSandboxCapabilities = await this.ensureWorkerSandboxCapabilities();
     const worktreeId = contract.id;
     const worktreePath = contract.worktreePath;
     const branchName = contract.branchName;
@@ -833,17 +961,18 @@ class FactorySupervisor {
       (await fileExists(path.join(worktreePath, ".git")));
     const requirement = reusesExistingWorktree
       ? { app: false, e2e: false }
-      : derivePortLeaseRequirement(contract);
+      : deriveEffectivePortLeaseRequirement(contract, workerSandboxCapabilities);
     const usedPorts = new Set(this.db.listActivePortLeases(this.config.projectId).map((lease) => lease.port));
     const allocatedPorts = allocatePorts(this.config, usedPorts, {
       app: requirement.app && contract.ports.app === undefined,
       e2e: requirement.e2e && contract.ports.e2e === undefined
     });
+    const portAwareContract = applyWorkerSandboxCapabilities(contract, workerSandboxCapabilities);
     const normalized: TaskContract = {
-      ...contract,
+      ...portAwareContract,
       ports: {
-        ...(contract.ports.app !== undefined ? { app: contract.ports.app } : {}),
-        ...(contract.ports.e2e !== undefined ? { e2e: contract.ports.e2e } : {}),
+        ...(portAwareContract.ports.app !== undefined ? { app: portAwareContract.ports.app } : {}),
+        ...(portAwareContract.ports.e2e !== undefined ? { e2e: portAwareContract.ports.e2e } : {}),
         ...(allocatedPorts.app !== undefined ? { app: allocatedPorts.app } : {}),
         ...(allocatedPorts.e2e !== undefined ? { e2e: allocatedPorts.e2e } : {})
       }

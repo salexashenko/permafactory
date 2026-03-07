@@ -45,6 +45,10 @@ export type TelegramOutboundKind =
 export type WorkerResultStatus = "completed" | "blocked" | "failed";
 export type CheckStatus = "passed" | "failed" | "not_run";
 
+export interface WorkerSandboxCapabilities {
+  canBindListenSockets: boolean;
+}
+
 export interface FactoryProjectConfig {
   projectId: string;
   repoRoot: string;
@@ -206,6 +210,7 @@ export interface ManagerTurnInput {
     memoryPercent: number;
     swapActive: boolean;
     freeWorkerSlots: number;
+    workerSandbox: WorkerSandboxCapabilities;
   };
   recentEvents: Array<{
     at: string;
@@ -282,6 +287,7 @@ export interface TaskContract {
     userIntent: string;
     relatedTaskIds: string[];
     blockingDecisions: string[];
+    runtimeCapabilities?: WorkerSandboxCapabilities;
   };
 }
 
