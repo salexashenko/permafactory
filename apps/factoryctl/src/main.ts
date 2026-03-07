@@ -228,6 +228,7 @@ async function handleStatus(args: string[]): Promise<void> {
       status: agent.status,
       taskId: agent.taskId
     })),
+    recentManagerTurns: db.listRecentManagerTurns(config.projectId, 5),
     openDecisions: openDecisions.length,
     activePortLeases: db.listActivePortLeases(config.projectId).length
   };
@@ -508,6 +509,18 @@ async function handleStart(args: string[]): Promise<void> {
   }
 
   const paths = getFactoryPaths(repoRoot);
+  const existingPidText = await readText(paths.supervisorPidPath).catch(() => undefined);
+  const existingPid = existingPidText ? Number.parseInt(existingPidText.trim(), 10) : undefined;
+  if (existingPid && Number.isFinite(existingPid)) {
+    try {
+      process.kill(existingPid, 0);
+      console.log(`factoryd is already running for ${repoRoot} (pid ${existingPid})`);
+      return;
+    } catch {
+      // Ignore stale pid files and launch a fresh daemon below.
+    }
+  }
+
   const spawned = await spawnLoggedProcess({
     command: process.execPath,
     args: commandArgs,

@@ -144,6 +144,24 @@ export interface ManagerTurnInput {
     currentStableCommit: string;
     currentCandidateCommit: string;
     dirtyFiles: string[];
+    trackedFileCount: number;
+    trackedFilesSample: string[];
+    appearsGreenfield: boolean;
+    branches: Array<{
+      name: string;
+      head?: string;
+      baseBranch?: string;
+      aheadBy?: number;
+      behindBy?: number;
+      canFastForwardBase?: boolean;
+      isIntegrated?: boolean;
+      linkedTaskIds: string[];
+      latestTaskStatus?: TaskStatus;
+      latestTaskUpdatedAt?: string;
+      worktreePath?: string;
+      dirtyFileCount?: number;
+      dirtyFilesSample?: string[];
+    }>;
   };
   decisionBudget: {
     date: string;
@@ -190,7 +208,23 @@ export interface ManagerTurnInput {
     status: "queued" | "running" | "blocked" | "review" | "done" | "failed";
     title: string;
     priority: TaskPriority;
+    branchName?: string;
+    baseBranch?: string;
+    worktreePath?: string;
+    relatedTaskIds: string[];
     blockedByDecisionIds: string[];
+    latestEventAt?: string;
+    latestEventType?: string;
+    latestEventSummary?: string;
+    latestEventPayload?: Record<string, unknown>;
+    branchHead?: string;
+    baseHead?: string;
+    aheadBy?: number;
+    behindBy?: number;
+    canFastForwardBase?: boolean;
+    isIntegrated?: boolean;
+    worktreeDirtyFileCount?: number;
+    worktreeDirtyFilesSample?: string[];
   }>;
   deployments: {
     stable: {
@@ -198,11 +232,17 @@ export interface ManagerTurnInput {
       url: string;
       commit: string;
       activeSlot: "stable-a" | "stable-b";
+      reason?: string;
+      updatedAt?: string;
+      canRollback?: boolean;
+      rollbackTargetCommit?: string;
     };
     preview: {
       status: DeploymentStatus;
       url: string;
       commit: string;
+      reason?: string;
+      updatedAt?: string;
     };
   };
   resources: {
@@ -217,6 +257,31 @@ export interface ManagerTurnInput {
     type: string;
     summary: string;
   }>;
+  recentManagerTurns: Array<{
+    at: string;
+    summary: string;
+    wakeReasons: string[];
+    actionCounts: {
+      tasksToStart: number;
+      tasksToCancel: number;
+      reviewsToStart: number;
+      integrations: number;
+      deployments: number;
+      decisions: number;
+      userMessages: number;
+    };
+    actionPreview: {
+      tasksToStart: string[];
+      tasksToCancel: string[];
+      reviewsToStart: string[];
+      integrations: string[];
+      deployments: string[];
+      decisions: string[];
+      userMessages: string[];
+    };
+    mismatchHints: string[];
+    rawOutput?: Record<string, unknown>;
+  }>;
 }
 
 export interface TelegramOutboundMessage {
@@ -227,10 +292,21 @@ export interface TelegramOutboundMessage {
 }
 
 export interface ReviewRequest {
-  taskId: string;
+  taskId?: string;
   branch: string;
   baseBranch: string;
   reason: string;
+  worktreePath?: string;
+  commit?: string;
+}
+
+export interface IntegrationRequest {
+  taskId?: string;
+  branch?: string;
+  targetBranch?: string;
+  reason: string;
+  worktreePath?: string;
+  commit?: string;
 }
 
 export interface DeploymentIntent {
@@ -297,6 +373,7 @@ export interface ManagerTurnOutput {
   tasksToStart: TaskContract[];
   tasksToCancel: string[];
   reviewsToStart: ReviewRequest[];
+  integrations: IntegrationRequest[];
   deployments: DeploymentIntent[];
   decisions: DecisionRequest[];
   assumptions: string[];

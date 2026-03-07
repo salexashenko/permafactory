@@ -229,6 +229,18 @@ export class FactoryDatabase {
         created_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS manager_turns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        at TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        wake_reasons_json TEXT NOT NULL DEFAULT '[]',
+        action_counts_json TEXT NOT NULL DEFAULT '{}',
+        action_preview_json TEXT NOT NULL DEFAULT '{}',
+        mismatch_hints_json TEXT NOT NULL DEFAULT '[]',
+        raw_output_json TEXT NOT NULL DEFAULT '{}'
+      );
+
       CREATE TABLE IF NOT EXISTS health_samples (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -255,6 +267,18 @@ export class FactoryDatabase {
         created_at TEXT NOT NULL
       );
     `);
+
+    this.ensureColumn("manager_turns", "action_preview_json", "TEXT NOT NULL DEFAULT '{}'");
+    this.ensureColumn("manager_turns", "mismatch_hints_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn("manager_turns", "raw_output_json", "TEXT NOT NULL DEFAULT '{}'");
+  }
+
+  private ensureColumn(tableName: string, columnName: string, definitionSql: string): void {
+    const rows = this.db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<Record<string, unknown>>;
+    const hasColumn = rows.some((row) => String(row.name) === columnName);
+    if (!hasColumn) {
+      this.db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definitionSql}`);
+    }
   }
 
   close(): void {
@@ -493,6 +517,81 @@ export class FactoryDatabase {
     }));
   }
 
+  insertManagerTurn(options: {
+    projectId: string;
+    summary: string;
+    wakeReasons: string[];
+    actionCounts: ManagerTurnInput["recentManagerTurns"][number]["actionCounts"];
+    actionPreview: ManagerTurnInput["recentManagerTurns"][number]["actionPreview"];
+    mismatchHints: string[];
+    rawOutput: Record<string, unknown>;
+  }): void {
+    this.db
+      .prepare(
+        "INSERT INTO manager_turns (project_id, at, summary, wake_reasons_json, action_counts_json, action_preview_json, mismatch_hints_json, raw_output_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      )
+      .run(
+        options.projectId,
+        nowIso(),
+        options.summary,
+        serializeJson(options.wakeReasons),
+        serializeJson(options.actionCounts),
+        serializeJson(options.actionPreview),
+        serializeJson(options.mismatchHints),
+        serializeJson(options.rawOutput)
+      );
+  }
+
+  listRecentManagerTurns(
+    projectId: string,
+    limit = 8
+  ): ManagerTurnInput["recentManagerTurns"] {
+    const rows = this.db
+      .prepare(
+        `
+          SELECT at, summary, wake_reasons_json, action_counts_json
+               , action_preview_json, mismatch_hints_json, raw_output_json
+          FROM manager_turns
+          WHERE project_id = ?
+          ORDER BY at DESC
+          LIMIT ?
+        `
+      )
+      .all(projectId, limit) as Record<string, unknown>[];
+
+    return rows.map((row) => ({
+      at: String(row.at),
+      summary: String(row.summary),
+      wakeReasons: parseJson<string[]>(row.wake_reasons_json, []),
+      actionCounts: parseJson<ManagerTurnInput["recentManagerTurns"][number]["actionCounts"]>(
+        row.action_counts_json,
+        {
+          tasksToStart: 0,
+          tasksToCancel: 0,
+          reviewsToStart: 0,
+          integrations: 0,
+          deployments: 0,
+          decisions: 0,
+          userMessages: 0
+        }
+      ),
+      actionPreview: parseJson<ManagerTurnInput["recentManagerTurns"][number]["actionPreview"]>(
+        row.action_preview_json,
+        {
+          tasksToStart: [],
+          tasksToCancel: [],
+          reviewsToStart: [],
+          integrations: [],
+          deployments: [],
+          decisions: [],
+          userMessages: []
+        }
+      ),
+      mismatchHints: parseJson<string[]>(row.mismatch_hints_json, []),
+      rawOutput: parseJson<Record<string, unknown>>(row.raw_output_json, {})
+    }));
+  }
+
   upsertAgent(agent: Omit<AgentRecord, "updatedAt">): void {
     this.db
       .prepare(
@@ -505,6 +604,7 @@ export class FactoryDatabase {
             @threadId, @turnId, @pid, @metadataJson, @updatedAt
           )
           ON CONFLICT(id) DO UPDATE SET
+            role = excluded.role,
             status = excluded.status,
             task_id = excluded.task_id,
             branch = excluded.branch,
@@ -950,14 +1050,22 @@ export class FactoryDatabase {
   }
 
   getDeploymentSnapshot(projectId: string): ManagerTurnInput["deployments"] {
+    const recentStableDeployments = this.listDeployments(projectId, "stable", 10);
+    const currentStableCommit = recentStableDeployments[0]?.commit;
+    const rollbackTarget = recentStableDeployments.find(
+      (deployment) =>
+        deployment.status === "healthy" &&
+        deployment.commit &&
+        deployment.commit !== currentStableCommit
+    )?.commit;
     const stable = this.db
       .prepare(
-        "SELECT status, url, commit_sha, active_slot FROM deployments WHERE project_id = ? AND target = 'stable' ORDER BY created_at DESC LIMIT 1"
+        "SELECT status, url, commit_sha, active_slot, reason, created_at FROM deployments WHERE project_id = ? AND target = 'stable' ORDER BY created_at DESC LIMIT 1"
       )
       .get(projectId) as Record<string, unknown> | undefined;
     const preview = this.db
       .prepare(
-        "SELECT status, url, commit_sha FROM deployments WHERE project_id = ? AND target = 'preview' ORDER BY created_at DESC LIMIT 1"
+        "SELECT status, url, commit_sha, reason, created_at FROM deployments WHERE project_id = ? AND target = 'preview' ORDER BY created_at DESC LIMIT 1"
       )
       .get(projectId) as Record<string, unknown> | undefined;
 
@@ -968,12 +1076,18 @@ export class FactoryDatabase {
         commit: typeof stable?.commit_sha === "string" ? stable.commit_sha : "",
         activeSlot:
           (stable?.active_slot as ManagerTurnInput["deployments"]["stable"]["activeSlot"]) ??
-          "stable-a"
+          "stable-a",
+        reason: typeof stable?.reason === "string" ? stable.reason : undefined,
+        updatedAt: typeof stable?.created_at === "string" ? stable.created_at : undefined,
+        canRollback: Boolean(rollbackTarget),
+        rollbackTargetCommit: rollbackTarget
       },
       preview: {
         status: (preview?.status as ManagerTurnInput["deployments"]["preview"]["status"]) ?? "down",
         url: typeof preview?.url === "string" ? preview.url : "http://127.0.0.1:3100",
-        commit: typeof preview?.commit_sha === "string" ? preview.commit_sha : ""
+        commit: typeof preview?.commit_sha === "string" ? preview.commit_sha : "",
+        reason: typeof preview?.reason === "string" ? preview.reason : undefined,
+        updatedAt: typeof preview?.created_at === "string" ? preview.created_at : undefined
       }
     };
   }
@@ -1045,6 +1159,34 @@ export class FactoryDatabase {
       config.decisionBudget.dailyLimit,
       config.decisionBudget.reserveCritical
     );
+    const latestTaskEvents = this.db
+      .prepare(
+        `
+          SELECT task_events.task_id, task_events.at, task_events.type, task_events.summary, task_events.payload_json
+          FROM task_events
+          JOIN (
+            SELECT task_id, MAX(at) AS max_at
+            FROM task_events
+            GROUP BY task_id
+          ) latest
+            ON latest.task_id = task_events.task_id
+           AND latest.max_at = task_events.at
+          JOIN tasks ON tasks.id = task_events.task_id
+          WHERE tasks.project_id = ?
+        `
+      )
+      .all(config.projectId) as Record<string, unknown>[];
+    const latestEventByTaskId = new Map(
+      latestTaskEvents.map((row) => [
+        String(row.task_id),
+        {
+          at: String(row.at),
+          type: String(row.type),
+          summary: String(row.summary),
+          payload: parseJson<Record<string, unknown>>(row.payload_json, {})
+        }
+      ])
+    );
 
     return {
       now: nowIso(),
@@ -1061,7 +1203,11 @@ export class FactoryDatabase {
         candidateBranch: project.candidateBranch,
         currentStableCommit: project.stableCommit,
         currentCandidateCommit: project.candidateCommit,
-        dirtyFiles: []
+        dirtyFiles: [],
+        trackedFileCount: 0,
+        trackedFilesSample: [],
+        appearsGreenfield: false,
+        branches: []
       },
       decisionBudget: budget,
       openDecisions: openDecisions.map((decision) => ({
@@ -1095,13 +1241,24 @@ export class FactoryDatabase {
         })),
       tasks: this.listTasks(config.projectId)
         .filter((task) => ["queued", "running", "blocked", "review", "done", "failed"].includes(task.status))
-        .map((task) => ({
-          id: task.id,
-          status: task.status as "queued" | "running" | "blocked" | "review" | "done" | "failed",
-          title: task.title,
-          priority: task.priority,
-          blockedByDecisionIds: task.blockedByDecisionIds
-        })),
+        .map((task) => {
+          const latestEvent = latestEventByTaskId.get(task.id);
+          return {
+            id: task.id,
+            status: task.status as "queued" | "running" | "blocked" | "review" | "done" | "failed",
+            title: task.title,
+            priority: task.priority,
+            branchName: task.branchName,
+            baseBranch: task.baseBranch,
+            worktreePath: task.worktreePath,
+            relatedTaskIds: task.contract?.context.relatedTaskIds ?? [],
+            blockedByDecisionIds: task.blockedByDecisionIds,
+            latestEventAt: latestEvent?.at,
+            latestEventType: latestEvent?.type,
+            latestEventSummary: latestEvent?.summary,
+            latestEventPayload: latestEvent?.payload
+          };
+        }),
       deployments: this.getDeploymentSnapshot(config.projectId),
       resources: {
         cpuPercent: 0,
@@ -1112,7 +1269,8 @@ export class FactoryDatabase {
           canBindListenSockets: true
         }
       },
-      recentEvents: this.listRecentEvents(config.projectId)
+      recentEvents: this.listRecentEvents(config.projectId),
+      recentManagerTurns: this.listRecentManagerTurns(config.projectId)
     };
   }
 

@@ -60,6 +60,7 @@ export interface FactoryPaths {
   scriptsDir: string;
   bootstrapScriptPath: string;
   lockPath: string;
+  supervisorPidPath: string;
 }
 
 export interface NormalizeManagerTurnOutputOptions {
@@ -94,7 +95,8 @@ export function getFactoryPaths(repoRoot: string): FactoryPaths {
     runsDir: path.join(factoryRoot, "runs"),
     scriptsDir: path.join(factoryRoot, "scripts"),
     bootstrapScriptPath: path.join(factoryRoot, "scripts", "bootstrap-worktree.sh"),
-    lockPath: path.join(factoryRoot, ".lock")
+    lockPath: path.join(factoryRoot, ".lock"),
+    supervisorPidPath: path.join(factoryRoot, "factoryd.pid")
   };
 }
 
@@ -801,19 +803,66 @@ export function normalizeManagerTurnOutput(
           const branch = firstString(review.branch, review.branchName);
           const baseBranch = firstString(review.baseBranch, review.base_branch) ?? options.candidateBranch;
           const reason = firstString(review.reason, review.summary, review.goal);
-          if (!taskId || !branch || !reason) {
+          if (!branch || !reason) {
             return undefined;
           }
 
           return {
-            taskId,
             branch,
             baseBranch,
-            reason
+            reason,
+            ...(taskId ? { taskId } : {}),
+            ...(firstString(review.worktreePath, review.worktree, review.worktree_path)
+              ? { worktreePath: firstString(review.worktreePath, review.worktree, review.worktree_path) }
+              : {}),
+            ...(firstString(review.commit, review.sha) ? { commit: firstString(review.commit, review.sha) } : {})
           };
         })
         .filter((entry): entry is ManagerTurnOutput["reviewsToStart"][number] => Boolean(entry))
     : [];
+
+  const rawIntegrations: unknown[] = Array.isArray(
+    object.integrations ?? object.merges ?? object.integrationsToApply
+  )
+    ? ((object.integrations ?? object.merges ?? object.integrationsToApply) as unknown[])
+    : [];
+
+  const integrations = rawIntegrations
+        .map((entry: unknown) => {
+          const integration = asRecord(entry);
+          if (!integration) {
+            return undefined;
+          }
+
+          const taskId = firstString(integration.taskId, integration.task_id);
+          const branch = firstString(integration.branch, integration.branchName);
+          const reason = firstString(integration.reason, integration.summary, integration.goal);
+          if ((!taskId && !branch) || !reason) {
+            return undefined;
+          }
+
+          return {
+            ...(taskId ? { taskId } : {}),
+            ...(branch ? { branch } : {}),
+            ...(firstString(integration.targetBranch, integration.target, integration.baseBranch, integration.base_branch)
+              ? {
+                  targetBranch: firstString(
+                    integration.targetBranch,
+                    integration.target,
+                    integration.baseBranch,
+                    integration.base_branch
+                  )
+                }
+              : {}),
+            reason,
+            ...(firstString(integration.worktreePath, integration.worktree, integration.worktree_path)
+              ? { worktreePath: firstString(integration.worktreePath, integration.worktree, integration.worktree_path) }
+              : {}),
+            ...(firstString(integration.commit, integration.sha) ? { commit: firstString(integration.commit, integration.sha) } : {})
+          };
+        })
+        .filter((entry: ManagerTurnOutput["integrations"][number] | undefined): entry is ManagerTurnOutput["integrations"][number] => Boolean(entry))
+    ;
 
   const deployments = Array.isArray(object.deployments)
     ? object.deployments
@@ -924,6 +973,7 @@ export function normalizeManagerTurnOutput(
     tasksToStart,
     tasksToCancel,
     reviewsToStart,
+    integrations,
     deployments,
     decisions,
     assumptions

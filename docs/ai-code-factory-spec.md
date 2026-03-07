@@ -29,7 +29,8 @@ The v1 design intentionally does **not** depend on the experimental Codex `multi
 - Maintain a continuously testable last-stable version.
 - Allow parallel coding agents without port collisions.
 - Make all meaningful frontend actions callable from the browser console.
-- Prefer deterministic orchestration over giving reliability responsibilities to an LLM.
+- Prefer deterministic orchestration for safety, durability, and recovery, while leaving workflow judgment to the manager whenever practical.
+- Assume model capability will improve faster than the harness; prefer exposing facts, tools, and invariants over hardcoding brittle flow logic.
 
 ## Non-Goals
 
@@ -55,6 +56,8 @@ The v1 design intentionally does **not** depend on the experimental Codex `multi
 - persistent state
 
 `factoryd` is the system of record. The manager agent advises and decides product/workflow matters, but `factoryd` enforces invariants.
+
+Design principle: keep `factoryd` opinionated about reliability boundaries, not about the exact product-workflow sequence. When a smarter manager can safely choose the next step from structured state, prefer giving it the relevant facts and execution affordances over adding fixed orchestration branches in the harness.
 
 ### 2. Codex control plane
 

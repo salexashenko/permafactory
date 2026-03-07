@@ -8,7 +8,12 @@ import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { FactoryDatabase } from "@permafactory/db";
-import { getConfigPath, loadProjectConfig, renderFactoryConfig } from "@permafactory/config";
+import {
+  detectPackageManagerAndScripts,
+  getConfigPath,
+  loadProjectConfig,
+  renderFactoryConfig
+} from "@permafactory/config";
 import { DEFAULT_MANAGER_THREAD_NAME } from "@permafactory/models";
 import type {
   CodingWorkerResult,
@@ -340,6 +345,7 @@ class FactorySupervisor {
   private workerChildren = new Map<string, ChildProcess>();
   private runtimeProcesses = new Map<RuntimeSlotName, ManagedRuntimeProcess>();
   private pendingManagerWakeReasons = new Set<string>(["startup"]);
+  private lastNoActiveWorkWakeAt = 0;
   private activeManagerTurnId?: string;
   private activeManagerThreadId?: string;
   private workerSandboxCapabilities?: WorkerSandboxCapabilities & { sandboxMode: string };
@@ -363,27 +369,53 @@ class FactorySupervisor {
     await ensureDir(this.paths.worktreesDir);
     await ensureDir(this.paths.runtimeDir);
     await ensureDir(this.paths.runsDir);
-    await this.refreshProjectState();
-    if (!once) {
-      await this.startDashboardServer();
+    await this.claimSupervisorPid();
+
+    try {
+      await this.refreshProjectState();
+      if (!once) {
+        await this.startDashboardServer();
+      }
+
+      do {
+        await this.tick();
+        if (!once) {
+          await new Promise((resolve) => setTimeout(resolve, this.config.scheduler.tickSeconds * 1000));
+        }
+      } while (!once);
+    } finally {
+      await this.releaseSupervisorPid();
+    }
+  }
+
+  private async claimSupervisorPid(): Promise<void> {
+    const existingPidText = await readText(this.paths.supervisorPidPath).catch(() => undefined);
+    const existingPid = existingPidText ? Number.parseInt(existingPidText.trim(), 10) : undefined;
+    if (existingPid && Number.isFinite(existingPid) && existingPid !== process.pid && this.isProcessAlive(existingPid)) {
+      throw new Error(`factoryd is already running for ${this.config.repoRoot} as pid ${existingPid}`);
     }
 
-    do {
-      await this.tick();
-      if (!once) {
-        await new Promise((resolve) => setTimeout(resolve, this.config.scheduler.tickSeconds * 1000));
-      }
-    } while (!once);
+    await writeText(this.paths.supervisorPidPath, `${process.pid}\n`);
+  }
+
+  private async releaseSupervisorPid(): Promise<void> {
+    const existingPidText = await readText(this.paths.supervisorPidPath).catch(() => undefined);
+    const existingPid = existingPidText ? Number.parseInt(existingPidText.trim(), 10) : undefined;
+    if (existingPid === process.pid) {
+      await writeText(this.paths.supervisorPidPath, "").catch(() => undefined);
+    }
   }
 
   private async tick(): Promise<void> {
     this.config = await loadProjectConfig(this.config.repoRoot);
     this.db.upsertProject(this.config);
     await this.refreshProjectState();
-    await this.reconcileRuntimeTargets();
+    const trackedFiles = await this.listTrackedFilesForBootstrapDetection();
+    const appearsGreenfield = isLikelyGreenfieldRepoFiles(trackedFiles, this.config.projectSpecPath);
+    await this.reconcileRuntimeTargets(appearsGreenfield);
     await this.reconcileStaleWorkers();
+    await this.reconcileCompletedTaskBranches();
     const workerSandboxCapabilities = await this.ensureWorkerSandboxCapabilities();
-    await this.maybeSeedGreenfieldBootstrapTask(workerSandboxCapabilities);
 
     const expiredDecisions = this.db.expireTimedOutDecisions();
     if (expiredDecisions.length > 0) {
@@ -407,6 +439,7 @@ class FactorySupervisor {
     };
     this.db.recordHealthSample(this.config.projectId, resources);
     await this.maybeSendDailyDigest(resources);
+    this.maybeWakeManagerForContinuity();
 
     if (this.shouldRunManager(resources)) {
       await this.runManagerTurn(resources);
@@ -415,7 +448,7 @@ class FactorySupervisor {
     await this.startQueuedTasksIfPossible();
   }
 
-  private shouldRunManager(resources: ManagerTurnInput["resources"]): boolean {
+  private shouldRunManager(_resources: ManagerTurnInput["resources"]): boolean {
     if (this.managerRunning) {
       return false;
     }
@@ -429,7 +462,32 @@ class FactorySupervisor {
       return true;
     }
 
+    const agents = this.db.listAgents(this.config.projectId);
+    const managerNeedsRecovery = agents.some(
+      (agent) => agent.role === "manager" && ["failed", "stalled"].includes(agent.status)
+    );
+    if (managerNeedsRecovery) {
+      return true;
+    }
     return false;
+  }
+
+  private maybeWakeManagerForContinuity(): void {
+    const tasks = this.db.listTasks(this.config.projectId);
+    const agents = this.db.listAgents(this.config.projectId);
+    const hasActiveTask = tasks.some((task) => ["queued", "running", "review"].includes(task.status));
+    const hasRunningWorker = agents.some((agent) => agent.role !== "manager" && agent.status === "running");
+    if (hasActiveTask || hasRunningWorker) {
+      return;
+    }
+
+    const cooldownMs = Math.max(this.config.scheduler.tickSeconds * 1000, 60_000);
+    if (Date.now() - this.lastNoActiveWorkWakeAt < cooldownMs) {
+      return;
+    }
+
+    this.pendingManagerWakeReasons.add("no_active_work");
+    this.lastNoActiveWorkWakeAt = Date.now();
   }
 
   private async runManagerTurn(resources: ManagerTurnInput["resources"]): Promise<void> {
@@ -467,7 +525,8 @@ class FactorySupervisor {
       const startedTurn = await client.startTurn(
         threadId,
         JSON.stringify(input, null, 2),
-        undefined
+        undefined,
+        this.config.scheduler.managerStallSeconds * 1000
       );
       this.activeManagerTurnId = startedTurn.turnId;
       this.db.upsertAgent({
@@ -573,9 +632,152 @@ class FactorySupervisor {
       this.config.repoRoot,
       this.config.candidateBranch
     );
+    const trackedFiles = await this.listTrackedFilesForBootstrapDetection();
+    input.repo.trackedFileCount = trackedFiles.length;
+    input.repo.trackedFilesSample = trackedFiles.slice(0, 50);
+    input.repo.appearsGreenfield = isLikelyGreenfieldRepoFiles(trackedFiles, this.config.projectSpecPath);
+    await this.enrichManagerTaskFacts(input);
+    await this.enrichManagerBranchFacts(input);
     input.resources = resources;
     input.deployments = this.db.getDeploymentSnapshot(this.config.projectId);
     return input;
+  }
+
+  private async enrichManagerTaskFacts(input: ManagerTurnInput): Promise<void> {
+    for (const task of input.tasks) {
+      task.branchHead = task.branchName
+        ? await currentCommit(this.config.repoRoot, task.branchName).catch(() => undefined)
+        : undefined;
+      task.baseHead = task.baseBranch
+        ? await currentCommit(this.config.repoRoot, task.baseBranch).catch(() => undefined)
+        : undefined;
+
+      if (task.branchHead && task.baseHead && task.branchName && task.baseBranch) {
+        task.isIntegrated = task.branchHead === task.baseHead;
+
+        const aheadBehind = await runCommand(
+          "git",
+          ["rev-list", "--left-right", "--count", `${task.baseBranch}...${task.branchName}`],
+          {
+            cwd: this.config.repoRoot,
+            allowNonZeroExit: true
+          }
+        );
+        if (aheadBehind.exitCode === 0) {
+          const [behindText, aheadText] = aheadBehind.stdout.trim().split(/\s+/);
+          task.behindBy = Number.parseInt(behindText ?? "0", 10) || 0;
+          task.aheadBy = Number.parseInt(aheadText ?? "0", 10) || 0;
+        }
+
+        const mergeBase = await runCommand("git", ["merge-base", task.baseBranch, task.branchName], {
+          cwd: this.config.repoRoot,
+          allowNonZeroExit: true
+        });
+        task.canFastForwardBase =
+          !task.isIntegrated &&
+          mergeBase.exitCode === 0 &&
+          mergeBase.stdout.trim() === task.baseHead;
+      } else if (task.branchHead && task.baseHead) {
+        task.isIntegrated = task.branchHead === task.baseHead;
+      }
+
+      if (task.worktreePath && (await fileExists(path.join(task.worktreePath, ".git")))) {
+        const dirtyFiles = await listDirtyFiles(task.worktreePath);
+        task.worktreeDirtyFileCount = dirtyFiles.length;
+        task.worktreeDirtyFilesSample = dirtyFiles.slice(0, 25);
+      }
+    }
+  }
+
+  private async enrichManagerBranchFacts(input: ManagerTurnInput): Promise<void> {
+    const taskGroups = new Map<
+      string,
+      Array<{
+        id: string;
+        status: ManagerTurnInput["tasks"][number]["status"];
+        updatedAt?: string;
+        worktreePath?: string;
+        baseBranch?: string;
+      }>
+    >();
+
+    for (const task of input.tasks) {
+      if (!task.branchName) {
+        continue;
+      }
+      const group = taskGroups.get(task.branchName) ?? [];
+      group.push({
+        id: task.id,
+        status: task.status,
+        updatedAt: task.latestEventAt,
+        worktreePath: task.worktreePath,
+        baseBranch: task.baseBranch
+      });
+      taskGroups.set(task.branchName, group);
+    }
+
+    const branchNames = new Set<string>([this.config.defaultBranch, this.config.candidateBranch, ...taskGroups.keys()]);
+    input.repo.branches = [];
+
+    for (const branchName of branchNames) {
+      const linkedTasks = taskGroups.get(branchName) ?? [];
+      const preferredTask = [...linkedTasks].sort((left, right) =>
+        (right.updatedAt ?? "").localeCompare(left.updatedAt ?? "")
+      )[0];
+      const head = await currentCommit(this.config.repoRoot, branchName).catch(() => undefined);
+      const baseBranch =
+        preferredTask?.baseBranch ??
+        (branchName !== this.config.candidateBranch && branchName !== this.config.defaultBranch
+          ? this.config.candidateBranch
+          : undefined);
+
+      const branchRecord: ManagerTurnInput["repo"]["branches"][number] = {
+        name: branchName,
+        head,
+        baseBranch,
+        linkedTaskIds: linkedTasks.map((task) => task.id),
+        latestTaskStatus: preferredTask?.status,
+        latestTaskUpdatedAt: preferredTask?.updatedAt,
+        worktreePath: preferredTask?.worktreePath
+      };
+
+      if (head && baseBranch) {
+        const baseHead = await currentCommit(this.config.repoRoot, baseBranch).catch(() => undefined);
+        if (baseHead) {
+          branchRecord.isIntegrated = head === baseHead;
+          const aheadBehind = await runCommand(
+            "git",
+            ["rev-list", "--left-right", "--count", `${baseBranch}...${branchName}`],
+            {
+              cwd: this.config.repoRoot,
+              allowNonZeroExit: true
+            }
+          );
+          if (aheadBehind.exitCode === 0) {
+            const [behindText, aheadText] = aheadBehind.stdout.trim().split(/\s+/);
+            branchRecord.behindBy = Number.parseInt(behindText ?? "0", 10) || 0;
+            branchRecord.aheadBy = Number.parseInt(aheadText ?? "0", 10) || 0;
+          }
+
+          const mergeBase = await runCommand("git", ["merge-base", baseBranch, branchName], {
+            cwd: this.config.repoRoot,
+            allowNonZeroExit: true
+          });
+          branchRecord.canFastForwardBase =
+            !branchRecord.isIntegrated &&
+            mergeBase.exitCode === 0 &&
+            mergeBase.stdout.trim() === baseHead;
+        }
+      }
+
+      if (preferredTask?.worktreePath && (await fileExists(path.join(preferredTask.worktreePath, ".git")))) {
+        const dirtyFiles = await listDirtyFiles(preferredTask.worktreePath);
+        branchRecord.dirtyFileCount = dirtyFiles.length;
+        branchRecord.dirtyFilesSample = dirtyFiles.slice(0, 25);
+      }
+
+      input.repo.branches.push(branchRecord);
+    }
   }
 
   private async ensureWorkerSandboxCapabilities(): Promise<WorkerSandboxCapabilities> {
@@ -656,14 +858,14 @@ class FactorySupervisor {
         continue;
       }
 
-      const shouldRequeue = agent.role !== "review";
-      this.db.updateTaskStatus(task.id, shouldRequeue ? "queued" : "failed");
+      const recoveredStatus = agent.role === "review" ? "review" : "queued";
+      this.db.updateTaskStatus(task.id, recoveredStatus);
       this.db.insertTaskEvent(
         task.id,
-        shouldRequeue ? "queued" : "failed",
-        shouldRequeue
-          ? "Task re-queued after worker process was missing during supervisor startup"
-          : "Review worker was missing during supervisor startup"
+        recoveredStatus,
+        agent.role === "review"
+          ? "Review worker disappeared during supervisor startup recovery; manager should decide the next step"
+          : "Task re-queued after worker process was missing during supervisor startup"
       );
       this.db.upsertAgent({
         id: agent.id,
@@ -703,6 +905,25 @@ class FactorySupervisor {
     if (wakeReasons.length > 0) {
       console.log(`[manager] wake reasons: ${wakeReasons.join(", ")}`);
     }
+    const actionPreview = this.buildManagerActionPreview(output);
+    const mismatchHints = this.computeManagerTurnMismatchHints(output.summary, actionPreview);
+    this.db.insertManagerTurn({
+      projectId: this.config.projectId,
+      summary: output.summary,
+      wakeReasons,
+      actionCounts: {
+        tasksToStart: output.tasksToStart.length,
+        tasksToCancel: output.tasksToCancel.length,
+        reviewsToStart: output.reviewsToStart.length,
+        integrations: output.integrations.length,
+        deployments: output.deployments.length,
+        decisions: output.decisions.length,
+        userMessages: output.userMessages.length
+      },
+      actionPreview,
+      mismatchHints,
+      rawOutput: JSON.parse(JSON.stringify(output)) as Record<string, unknown>
+    });
 
     for (const decision of output.decisions) {
       await this.maybeCreateDecision(decision);
@@ -734,43 +955,91 @@ class FactorySupervisor {
     }
 
     for (const review of output.reviewsToStart) {
-      const task = this.db.getTask(review.taskId);
-      if (!task?.contract || !["review", "blocked", "done"].includes(task.status)) {
-        continue;
-      }
-      if (
-        this.db
-          .listAgents(this.config.projectId)
-          .some((agent) => agent.role === "review" && agent.taskId === review.taskId && agent.status === "running")
-      ) {
-        continue;
-      }
-      const reviewTask: TaskContract = {
-        ...task.contract,
-        id: task.id,
-        title: `Review ${task.title}`,
-        goal: review.reason,
-        needsPreview: false,
-        ports: {},
-        runtime: { maxRuntimeMinutes: 30, reasoningEffort: "medium" },
-        constraints: {
-          ...task.contract.constraints,
-          mustRunChecks: []
+      await this.startReviewRequest(review);
+    }
+
+    for (const integration of output.integrations) {
+      try {
+        await this.integrateRequest(integration);
+      } catch (error) {
+        const taskForEvent =
+          (integration.taskId ? this.db.getTask(integration.taskId) : undefined) ??
+          (integration.branch ? this.findTaskByBranch(integration.branch) : undefined);
+        if (taskForEvent) {
+          this.db.insertTaskEvent(
+            taskForEvent.id,
+            "failed",
+            `Integration failed: ${error instanceof Error ? error.message : String(error)}`
+          );
         }
-      };
-      await this.startWorker(reviewTask, "review");
+        this.pendingManagerWakeReasons.add("integration_failure");
+      }
     }
 
     for (const deployment of output.deployments) {
       try {
         await this.handleDeploymentIntent(deployment);
       } catch (error) {
+        this.pendingManagerWakeReasons.add("deployment_failure");
         await this.sendTelegramMessage(
           "incident_alert",
           `Deployment ${deployment.kind} failed: ${error instanceof Error ? error.message : String(error)}`
         );
       }
     }
+  }
+
+  private buildManagerActionPreview(
+    output: ManagerTurnOutput
+  ): ManagerTurnInput["recentManagerTurns"][number]["actionPreview"] {
+    return {
+      tasksToStart: output.tasksToStart.map((task) => `${task.id}:${task.branchName}`),
+      tasksToCancel: output.tasksToCancel,
+      reviewsToStart: output.reviewsToStart.map((review) => `${review.branch}->${review.baseBranch}`),
+      integrations: output.integrations.map(
+        (integration) =>
+          `${integration.branch ?? integration.taskId ?? "unknown"}->${integration.targetBranch ?? "default"}`
+      ),
+      deployments: output.deployments.map((deployment) => deployment.kind),
+      decisions: output.decisions.map((decision) => `${decision.id}:${decision.title}`),
+      userMessages: output.userMessages.map((message) => `${message.kind}:${message.text.slice(0, 80)}`)
+    };
+  }
+
+  private computeManagerTurnMismatchHints(
+    summary: string,
+    actionPreview: ManagerTurnInput["recentManagerTurns"][number]["actionPreview"]
+  ): string[] {
+    const hints: string[] = [];
+    if (
+      /(queued|started|requested).{0,24}review|review.{0,24}(queued|started|requested)/i.test(summary) &&
+      actionPreview.reviewsToStart.length === 0
+    ) {
+      hints.push("summary_mentions_review_without_review_action");
+    }
+    if (
+      /(integrat|merge|fast-forward)/i.test(summary) &&
+      actionPreview.integrations.length === 0
+    ) {
+      hints.push("summary_mentions_integration_without_integration_action");
+    }
+    if (
+      /(deploy|rollback|promot|ship|preview update)/i.test(summary) &&
+      actionPreview.deployments.length === 0
+    ) {
+      hints.push("summary_mentions_deployment_without_deployment_action");
+    }
+    if (
+      /(started|queued).{0,24}(task|worker|coding|cleanup|recovery)|\bstarted a fresh\b/i.test(summary) &&
+      actionPreview.tasksToStart.length === 0 &&
+      actionPreview.reviewsToStart.length === 0
+    ) {
+      hints.push("summary_mentions_started_work_without_start_action");
+    }
+    if (/\bcancel/i.test(summary) && actionPreview.tasksToCancel.length === 0) {
+      hints.push("summary_mentions_cancel_without_cancel_action");
+    }
+    return hints;
   }
 
   private async maybeCreateDecision(decision: ManagerTurnOutput["decisions"][number]): Promise<void> {
@@ -924,72 +1193,179 @@ class FactorySupervisor {
     }
   }
 
-  private async maybeSeedGreenfieldBootstrapTask(
-    workerSandboxCapabilities: WorkerSandboxCapabilities
-  ): Promise<void> {
-    if (!["waiting_for_first_task", "baselining_repo"].includes(this.config.bootstrap.status)) {
-      return;
-    }
-
-    if (this.db.listTasks(this.config.projectId).length > 0) {
-      return;
-    }
-
-    if (this.db.listInboxItems(this.config.projectId, ["new"]).length > 0) {
-      return;
-    }
-
-    const trackedFiles = await this.listTrackedFilesForBootstrapDetection();
-    if (!isLikelyGreenfieldRepoFiles(trackedFiles, this.config.projectSpecPath)) {
-      return;
-    }
-
-    const taskId = "bootstrap-greenfield";
-    const contract: TaskContract = {
-      id: taskId,
-      kind: "code",
-      title: "Build first runnable product slice from spec",
-      goal: `Treat this repo as an intentional greenfield start and build the first coherent implementation slice described in ${this.config.projectSpecPath}. Establish the minimal runnable baseline needed for continued product work instead of blocking on missing existing code.`,
-      acceptanceCriteria: [
-        `Repository gains the first working implementation slice aligned with ${this.config.projectSpecPath}.`,
-        "The repo includes the minimal project/tooling baseline needed for continued iteration in this codebase.",
-        "At least one meaningful non-binding verification path passes and is reported in the worker result."
-      ],
-      baseBranch: this.config.candidateBranch,
-      branchName: "task/bootstrap-greenfield",
-      worktreePath: path.join(this.paths.worktreesDir, taskId),
-      lockScope: ["repo"],
-      needsPreview: false,
-      ports: {},
-      runtime: {
-        maxRuntimeMinutes: 90,
-        reasoningEffort: "extra-high"
-      },
-      constraints: {
-        mustRunChecks: this.seededGreenfieldChecks()
-      },
-      context: {
-        userIntent: `Start building the product from ${this.config.projectSpecPath}.`,
-        relatedTaskIds: [],
-        blockingDecisions: [],
-        runtimeCapabilities: workerSandboxCapabilities
+  private async reconcileCompletedTaskBranches(): Promise<void> {
+    for (const task of this.db.listTasks(this.config.projectId)) {
+      if (!task.contract || !["done", "review"].includes(task.status) || !task.worktreePath) {
+        continue;
       }
-    };
 
-    await this.persistBootstrapStatus("baselining_repo");
-    await this.materializeAndStartTask(contract);
-    this.db.insertTaskEvent(
-      taskId,
-      "queued",
-      `Seeded the initial greenfield implementation task from ${this.config.projectSpecPath}`
-    );
-    this.pendingManagerWakeReasons.add("greenfield_seeded");
+      if (!(await fileExists(path.join(task.worktreePath, ".git")))) {
+        continue;
+      }
+
+      const committedBranchHead = await this.commitTaskWorktree(task.contract);
+      if (!committedBranchHead) {
+        continue;
+      }
+
+      this.db.insertTaskEvent(
+        task.id,
+        "committed",
+        `Recovered task branch commit at ${committedBranchHead.slice(0, 12)}`,
+        { commit: committedBranchHead }
+      );
+      this.pendingManagerWakeReasons.add("task_branch_committed");
+    }
   }
 
-  private seededGreenfieldChecks(): string[] {
-    return [this.config.scripts.build, this.config.scripts.test, this.config.scripts.smoke].filter(
-      (script, index, allScripts) => !isPlaceholderScript(script) && allScripts.indexOf(script) === index
+  private findTaskByBranch(branchName: string): ReturnType<FactoryDatabase["getTask"]> {
+    return this.db.listTasks(this.config.projectId).find((task) => task.branchName === branchName);
+  }
+
+  private async startReviewRequest(review: ManagerTurnOutput["reviewsToStart"][number]): Promise<void> {
+    const task =
+      (review.taskId ? this.db.getTask(review.taskId) : undefined) ?? this.findTaskByBranch(review.branch);
+    if (!task?.contract) {
+      return;
+    }
+
+    if (
+      this.db
+        .listAgents(this.config.projectId)
+        .some((agent) => agent.taskId === task.id && agent.status === "running")
+    ) {
+      return;
+    }
+
+    if (review.commit) {
+      const currentBranchHead = await currentCommit(this.config.repoRoot, review.branch).catch(() => undefined);
+      if (!currentBranchHead || currentBranchHead !== review.commit) {
+        throw new Error(
+          `Review request for ${review.branch} expected ${review.commit.slice(0, 12)} but found ${currentBranchHead?.slice(0, 12) ?? "missing"}`
+        );
+      }
+    }
+
+    const reviewTask: TaskContract = {
+      ...task.contract,
+      id: task.id,
+      title: `Review ${task.title}`,
+      goal: review.reason,
+      baseBranch: review.baseBranch || task.baseBranch || task.contract.baseBranch,
+      branchName: review.branch || task.branchName || task.contract.branchName,
+      worktreePath: review.worktreePath || task.worktreePath || task.contract.worktreePath,
+      needsPreview: false,
+      ports: {},
+      runtime: { maxRuntimeMinutes: 30, reasoningEffort: "medium" },
+      constraints: {
+        ...task.contract.constraints,
+        mustRunChecks: []
+      }
+    };
+    await this.startWorker(reviewTask, "review");
+  }
+
+  private async commitTaskWorktree(
+    contract: Pick<TaskContract, "id" | "title" | "branchName" | "worktreePath">,
+    recommendedCommitMessage?: string,
+    summary?: string
+  ): Promise<string | undefined> {
+    const relevantChanges = await this.listRelevantWorktreeChanges(contract.worktreePath);
+    if (relevantChanges.length === 0) {
+      return undefined;
+    }
+
+    await runCommand("git", ["add", "-A", "--", "."], {
+      cwd: contract.worktreePath
+    });
+    await runCommand("git", ["reset", "--", ".factory.env"], {
+      cwd: contract.worktreePath,
+      allowNonZeroExit: true
+    });
+
+    const stagedChanges = await this.listRelevantWorktreeChanges(contract.worktreePath);
+    if (stagedChanges.length === 0) {
+      return undefined;
+    }
+
+    const firstLine =
+      recommendedCommitMessage?.trim().split(/\r?\n/, 1)[0] ??
+      summary?.trim().split(/\r?\n/, 1)[0] ??
+      `Complete ${contract.title}`;
+    const commitMessage = firstLine.slice(0, 120) || `Complete ${contract.id}`;
+    const commit = await runCommand("git", ["commit", "-m", commitMessage, "--no-verify"], {
+      cwd: contract.worktreePath,
+      allowNonZeroExit: true
+    });
+    if (commit.exitCode !== 0 && !/nothing to commit/i.test(commit.stderr + commit.stdout)) {
+      throw new Error(`Failed to commit ${contract.branchName}: ${(commit.stderr || commit.stdout).trim()}`);
+    }
+
+    await this.refreshDetectedScriptsFromWorktree(contract.worktreePath);
+    return await currentCommit(contract.worktreePath, "HEAD");
+  }
+
+  private async listRelevantWorktreeChanges(worktreePath: string): Promise<string[]> {
+    const result = await runCommand("git", ["status", "--porcelain", "--untracked-files=all"], {
+      cwd: worktreePath
+    });
+    return result.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trimEnd())
+      .filter((line) => line.length > 0)
+      .map((line) => line.slice(3).split(" -> ").at(-1)?.trim() ?? "")
+      .filter((file) => file.length > 0 && file !== ".factory.env");
+  }
+
+  private async integrateRequest(integration: ManagerTurnOutput["integrations"][number]): Promise<void> {
+    const task =
+      (integration.taskId ? this.db.getTask(integration.taskId) : undefined) ??
+      (integration.branch ? this.findTaskByBranch(integration.branch) : undefined);
+    if (!task?.contract || !task.branchName || !task.worktreePath) {
+      throw new Error(
+        `Cannot integrate unknown branch target ${integration.taskId ?? integration.branch ?? "unknown"}`
+      );
+    }
+
+    const mergeTarget = integration.targetBranch ?? task.baseBranch ?? task.contract.baseBranch;
+    if (!mergeTarget) {
+      throw new Error(`Task ${task.id} has no merge target`);
+    }
+
+    if (integration.commit) {
+      const currentBranchHead = await currentCommit(this.config.repoRoot, task.branchName).catch(() => undefined);
+      if (!currentBranchHead || currentBranchHead !== integration.commit) {
+        throw new Error(
+          `Integration request for ${task.branchName} expected ${integration.commit.slice(0, 12)} but found ${currentBranchHead?.slice(0, 12) ?? "missing"}`
+        );
+      }
+    }
+
+    const committedBranchHead =
+      (await this.commitTaskWorktree(task.contract, undefined, integration.reason)) ??
+      (await currentCommit(this.config.repoRoot, task.branchName));
+    const targetHead = await currentCommit(this.config.repoRoot, mergeTarget);
+    const mergeBase = await runCommand("git", ["merge-base", mergeTarget, task.branchName], {
+      cwd: this.config.repoRoot
+    });
+    if (mergeBase.stdout.trim() !== targetHead) {
+      throw new Error(`Cannot fast-forward ${mergeTarget} to ${task.branchName}`);
+    }
+
+    await runCommand(
+      "git",
+      ["update-ref", `refs/heads/${mergeTarget}`, committedBranchHead],
+      { cwd: this.config.repoRoot }
     );
+    await this.refreshDetectedScriptsFromWorktree(task.worktreePath);
+    await this.refreshProjectState();
+    this.db.insertTaskEvent(
+      task.id,
+      "integrated",
+      `Integrated ${task.branchName} into ${mergeTarget} at ${committedBranchHead.slice(0, 12)}: ${integration.reason}`,
+      { targetBranch: mergeTarget, commit: committedBranchHead }
+    );
+    this.pendingManagerWakeReasons.add("branch_integrated");
   }
 
   private async startQueuedTasksIfPossible(): Promise<void> {
@@ -1253,11 +1629,29 @@ class FactorySupervisor {
       worktreePath: contract.worktreePath
     });
 
+    let committedBranchHead: string | undefined;
+    if (role === "code" && validated.value.status === "completed") {
+      const result = validated.value as CodingWorkerResult;
+      committedBranchHead = await this.commitTaskWorktree(
+        contract,
+        result.recommendedCommitMessage,
+        result.summary
+      );
+    }
+
     if (role === "code") {
       const result = validated.value as CodingWorkerResult;
       const nextStatus = result.status === "completed" ? (result.needsReview ? "review" : "done") : result.status;
       this.db.updateTaskStatus(contract.id, nextStatus as never);
       this.db.insertTaskEvent(contract.id, result.status, result.summary, result);
+      if (result.status === "completed" && committedBranchHead) {
+        this.db.insertTaskEvent(
+          contract.id,
+          "committed",
+          `Committed ${contract.branchName} at ${committedBranchHead.slice(0, 12)}`,
+          { commit: committedBranchHead }
+        );
+      }
     } else if (role === "review") {
       const result = validated.value as ReviewerResult;
       const nextStatus =
@@ -1267,7 +1661,11 @@ class FactorySupervisor {
             ? "done"
             : "failed";
       this.db.updateTaskStatus(contract.id, nextStatus as never);
-      this.db.insertTaskEvent(contract.id, result.status, result.summary, result);
+      const reviewSummary =
+        result.status === "completed"
+          ? `Review ${result.recommendedAction}: ${result.summary}`
+          : result.summary;
+      this.db.insertTaskEvent(contract.id, result.status, reviewSummary, result);
     } else {
       const result = validated.value as TesterResult;
       this.db.updateTaskStatus(contract.id, result.status === "completed" ? "done" : (result.status as never));
@@ -1324,14 +1722,45 @@ class FactorySupervisor {
       return;
     }
 
+    const rollbackState = this.db.getDeploymentSnapshot(this.config.projectId).stable;
+    if (!intent.commit && !intent.rollbackTag && !rollbackState.canRollback) {
+      console.log("[manager] skipped rollback_stable: no rollback target is currently available");
+      return;
+    }
+
     const commit = await this.resolveRollbackCommit(intent.rollbackTag, intent.commit);
     await this.rollbackStable(commit, intent.reason, intent.rollbackTag);
   }
 
-  private async reconcileRuntimeTargets(): Promise<void> {
+  private async reconcileRuntimeTargets(appearsGreenfield: boolean): Promise<void> {
     const snapshot = this.db.getDeploymentSnapshot(this.config.projectId);
     const stableUrl = await this.resolveStableUrl();
     const previewUrl = await this.resolvePreviewUrl();
+    if (appearsGreenfield) {
+      if (snapshot.stable.status !== "down" || snapshot.stable.reason !== "stable runtime deferred until repo has runnable app files") {
+        this.db.recordDeployment({
+          projectId: this.config.projectId,
+          target: "stable",
+          status: "down",
+          url: stableUrl,
+          commit: snapshot.stable.commit,
+          activeSlot: snapshot.stable.activeSlot,
+          reason: "stable runtime deferred until repo has runnable app files"
+        });
+      }
+      if (snapshot.preview.status !== "down" || snapshot.preview.reason !== "preview runtime deferred until repo has runnable app files") {
+        this.db.recordDeployment({
+          projectId: this.config.projectId,
+          target: "preview",
+          status: "down",
+          url: previewUrl,
+          commit: snapshot.preview.commit,
+          reason: "preview runtime deferred until repo has runnable app files"
+        });
+      }
+      return;
+    }
+
     if (snapshot.stable.commit) {
       await this.ensureStableProxyServer();
       const activeSlot = snapshot.stable.activeSlot;
@@ -1908,6 +2337,24 @@ class FactorySupervisor {
     );
   }
 
+  private async refreshDetectedScriptsFromWorktree(worktreePath: string): Promise<void> {
+    const detected = await detectPackageManagerAndScripts(worktreePath);
+    if (JSON.stringify(detected.scripts) === JSON.stringify(this.config.scripts)) {
+      return;
+    }
+
+    this.config = {
+      ...this.config,
+      scripts: detected.scripts
+    };
+    await this.persistConfig();
+  }
+
+  private async persistConfig(): Promise<void> {
+    await writeText(getConfigPath(this.config.repoRoot), renderFactoryConfig(this.config));
+    this.db.upsertProject(this.config);
+  }
+
   private async persistBootstrapStatus(
     status: FactoryProjectConfig["bootstrap"]["status"]
   ): Promise<void> {
@@ -1922,8 +2369,7 @@ class FactorySupervisor {
         status
       }
     };
-    await writeText(getConfigPath(this.config.repoRoot), renderFactoryConfig(this.config));
-    this.db.upsertProject(this.config);
+    await this.persistConfig();
   }
 
   private async listTrackedFilesForBootstrapDetection(): Promise<string[]> {

@@ -189,3 +189,116 @@ test("expireTimedOutDecisions applies the default option", async () => {
     assert.equal(decision?.resolvedOptionId, "opt_a");
   });
 });
+
+test("upsertAgent updates the role when an existing agent id is reused", async () => {
+  await withDb((db, config) => {
+    db.upsertAgent({
+      id: "agent-task",
+      projectId: config.projectId,
+      role: "code",
+      status: "running",
+      taskId: "task-1",
+      branch: "task/task-1",
+      worktreePath: "/tmp/task-1"
+    });
+
+    db.upsertAgent({
+      id: "agent-task",
+      projectId: config.projectId,
+      role: "review",
+      status: "running",
+      taskId: "task-1",
+      branch: "task/task-1",
+      worktreePath: "/tmp/task-1"
+    });
+
+    const agent = db.listAgents(config.projectId).find((candidate) => candidate.id === "agent-task");
+    assert.equal(agent?.role, "review");
+    assert.equal(agent?.status, "running");
+  });
+});
+
+test("getManagerInput exposes structured latest task facts and deployment reasons", async () => {
+  await withDb((db, config) => {
+    const contract = makeTask("task_structured", []);
+    contract.context.relatedTaskIds = ["parent-task"];
+
+    db.upsertTask({
+      projectId: config.projectId,
+      id: contract.id,
+      kind: "code",
+      status: "done",
+      title: contract.title,
+      priority: "medium",
+      goal: contract.goal,
+      branchName: contract.branchName,
+      baseBranch: contract.baseBranch,
+      worktreePath: contract.worktreePath,
+      contract,
+      blockedByDecisionIds: []
+    });
+    db.insertTaskEvent(contract.id, "completed", "Structured completion", {
+      status: "completed",
+      recommendedAction: "merge",
+      checks: [{ name: "build", status: "passed" }]
+    });
+    db.recordDeployment({
+      projectId: config.projectId,
+      target: "preview",
+      status: "down",
+      url: "http://127.0.0.1:3100",
+      commit: "abc123",
+      reason: "Healthcheck failed"
+    });
+
+    const input = db.getManagerInput(config);
+    const task = input.tasks.find((candidate) => candidate.id === contract.id);
+
+    assert.deepEqual(task?.relatedTaskIds, ["parent-task"]);
+    assert.equal(task?.latestEventType, "completed");
+    assert.equal(task?.latestEventPayload?.recommendedAction, "merge");
+    assert.equal(input.deployments.preview.reason, "Healthcheck failed");
+    assert.equal(input.deployments.preview.commit, "abc123");
+  });
+});
+
+test("getManagerInput exposes recent manager turns", async () => {
+  await withDb((db, config) => {
+    db.insertManagerTurn({
+      projectId: config.projectId,
+      summary: "Queued a branch review",
+      wakeReasons: ["no_active_work", "deployment_failure"],
+      actionCounts: {
+        tasksToStart: 0,
+        tasksToCancel: 0,
+        reviewsToStart: 1,
+        integrations: 0,
+        deployments: 0,
+        decisions: 0,
+        userMessages: 0
+      },
+      actionPreview: {
+        tasksToStart: [],
+        tasksToCancel: [],
+        reviewsToStart: ["task/bootstrap->candidate"],
+        integrations: [],
+        deployments: [],
+        decisions: [],
+        userMessages: []
+      },
+      mismatchHints: ["summary_mentions_review_without_review_action"],
+      rawOutput: {
+        summary: "Queued a branch review",
+        reviewsToStart: [{ branch: "task/bootstrap", baseBranch: "candidate", reason: "Review it" }]
+      }
+    });
+
+    const input = db.getManagerInput(config);
+    assert.equal(input.recentManagerTurns[0]?.summary, "Queued a branch review");
+    assert.deepEqual(input.recentManagerTurns[0]?.wakeReasons, ["no_active_work", "deployment_failure"]);
+    assert.equal(input.recentManagerTurns[0]?.actionCounts.reviewsToStart, 1);
+    assert.deepEqual(input.recentManagerTurns[0]?.actionPreview.reviewsToStart, ["task/bootstrap->candidate"]);
+    assert.deepEqual(input.recentManagerTurns[0]?.mismatchHints, ["summary_mentions_review_without_review_action"]);
+    assert.equal(input.recentManagerTurns[0]?.rawOutput?.summary, "Queued a branch review");
+  });
+});

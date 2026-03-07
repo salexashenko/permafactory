@@ -238,6 +238,7 @@ test("manager output schema accepts a minimal valid payload", async () => {
     tasksToStart: [],
     tasksToCancel: [],
     reviewsToStart: [],
+    integrations: [],
     deployments: [],
     decisions: [],
     assumptions: []
@@ -255,6 +256,7 @@ test("manager output schema rejects malformed tasks", async () => {
     tasksToStart: [{ id: "x" }] satisfies Partial<TaskContract>[],
     tasksToCancel: [],
     reviewsToStart: [],
+    integrations: [],
     deployments: [],
     decisions: [],
     assumptions: []
@@ -262,6 +264,36 @@ test("manager output schema rejects malformed tasks", async () => {
 
   const result = await validateWithSchema<ManagerTurnOutput>(schemaPath, malformed);
   assert.equal(result.valid, false);
+});
+
+test("manager output schema accepts branch-first review and integration actions", async () => {
+  const schemaPath = path.resolve("schemas/manager-output.schema.json");
+  const output = {
+    summary: "Advance the repaired branch",
+    userMessages: [],
+    tasksToStart: [],
+    tasksToCancel: [],
+    reviewsToStart: [
+      {
+        branch: "task/bootstrap-greenfield",
+        baseBranch: "candidate",
+        reason: "Review the repaired branch state before candidate integration."
+      }
+    ],
+    integrations: [
+      {
+        branch: "task/bootstrap-greenfield",
+        targetBranch: "candidate",
+        reason: "Fast-forward the repaired bootstrap branch into candidate."
+      }
+    ],
+    deployments: [],
+    decisions: [],
+    assumptions: []
+  };
+
+  const result = await validateWithSchema<ManagerTurnOutput>(schemaPath, output);
+  assert.equal(result.valid, true);
 });
 
 test("normalizeManagerTurnOutput materializes planner-friendly manager output", async () => {
@@ -279,6 +311,14 @@ test("normalizeManagerTurnOutput materializes planner-friendly manager output", 
           checks: ["npm run build", "npm test", "npm run smoke"]
         }
       ],
+      reviewsToStart: [
+        {
+          branch: "task_fixed_branch",
+          baseBranch: "candidate",
+          reason: "Review the repaired branch before merge."
+        }
+      ],
+      integrations: [{ branch: "task_fixed_branch", reason: "Fast-forward the approved slice into candidate." }],
       deployments: [{ action: "preview", summary: "Refresh preview after baseline checks." }],
       assumptions: ["Use candidate as the default base branch."]
     },
@@ -294,6 +334,8 @@ test("normalizeManagerTurnOutput materializes planner-friendly manager output", 
   assert.equal(normalized.tasksToStart[0]?.id, "task_fixed");
   assert.equal(normalized.tasksToStart[0]?.branchName, "agent/baseline-the-calculator-app");
   assert.equal(normalized.tasksToStart[0]?.worktreePath, "/tmp/demo/.factory/worktrees/task_fixed");
+  assert.equal(normalized.reviewsToStart[0]?.branch, "task_fixed_branch");
+  assert.equal(normalized.integrations[0]?.branch, "task_fixed_branch");
   assert.equal(normalized.deployments[0]?.kind, "deploy_preview");
 
   const result = await validateWithSchema<ManagerTurnOutput>(schemaPath, normalized);
