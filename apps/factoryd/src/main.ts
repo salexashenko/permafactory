@@ -8,7 +8,7 @@ import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { FactoryDatabase } from "@permafactory/db";
-import { loadProjectConfig } from "@permafactory/config";
+import { getConfigPath, loadProjectConfig, renderFactoryConfig } from "@permafactory/config";
 import { DEFAULT_MANAGER_THREAD_NAME } from "@permafactory/models";
 import type {
   CodingWorkerResult,
@@ -31,6 +31,7 @@ import {
   fileExists,
   getFactoryPaths,
   isPlaceholderScript,
+  isLikelyGreenfieldRepoFiles,
   listDirtyFiles,
   loadEnvFile,
   localDateString,
@@ -382,6 +383,7 @@ class FactorySupervisor {
     await this.reconcileRuntimeTargets();
     await this.reconcileStaleWorkers();
     const workerSandboxCapabilities = await this.ensureWorkerSandboxCapabilities();
+    await this.maybeSeedGreenfieldBootstrapTask(workerSandboxCapabilities);
 
     const expiredDecisions = this.db.expireTimedOutDecisions();
     if (expiredDecisions.length > 0) {
@@ -893,6 +895,10 @@ class FactorySupervisor {
     );
     const initialStatus = unresolvedBlockingDecisions.length > 0 ? "blocked" : "queued";
 
+    if (this.config.bootstrap.status === "waiting_for_first_task") {
+      await this.persistBootstrapStatus("baselining_repo");
+    }
+
     this.db.upsertTask({
       projectId: this.config.projectId,
       id: normalized.id,
@@ -916,6 +922,74 @@ class FactorySupervisor {
       );
       return;
     }
+  }
+
+  private async maybeSeedGreenfieldBootstrapTask(
+    workerSandboxCapabilities: WorkerSandboxCapabilities
+  ): Promise<void> {
+    if (!["waiting_for_first_task", "baselining_repo"].includes(this.config.bootstrap.status)) {
+      return;
+    }
+
+    if (this.db.listTasks(this.config.projectId).length > 0) {
+      return;
+    }
+
+    if (this.db.listInboxItems(this.config.projectId, ["new"]).length > 0) {
+      return;
+    }
+
+    const trackedFiles = await this.listTrackedFilesForBootstrapDetection();
+    if (!isLikelyGreenfieldRepoFiles(trackedFiles, this.config.projectSpecPath)) {
+      return;
+    }
+
+    const taskId = "bootstrap-greenfield";
+    const contract: TaskContract = {
+      id: taskId,
+      kind: "code",
+      title: "Build first runnable product slice from spec",
+      goal: `Treat this repo as an intentional greenfield start and build the first coherent implementation slice described in ${this.config.projectSpecPath}. Establish the minimal runnable baseline needed for continued product work instead of blocking on missing existing code.`,
+      acceptanceCriteria: [
+        `Repository gains the first working implementation slice aligned with ${this.config.projectSpecPath}.`,
+        "The repo includes the minimal project/tooling baseline needed for continued iteration in this codebase.",
+        "At least one meaningful non-binding verification path passes and is reported in the worker result."
+      ],
+      baseBranch: this.config.candidateBranch,
+      branchName: "task/bootstrap-greenfield",
+      worktreePath: path.join(this.paths.worktreesDir, taskId),
+      lockScope: ["repo"],
+      needsPreview: false,
+      ports: {},
+      runtime: {
+        maxRuntimeMinutes: 90,
+        reasoningEffort: "extra-high"
+      },
+      constraints: {
+        mustRunChecks: this.seededGreenfieldChecks()
+      },
+      context: {
+        userIntent: `Start building the product from ${this.config.projectSpecPath}.`,
+        relatedTaskIds: [],
+        blockingDecisions: [],
+        runtimeCapabilities: workerSandboxCapabilities
+      }
+    };
+
+    await this.persistBootstrapStatus("baselining_repo");
+    await this.materializeAndStartTask(contract);
+    this.db.insertTaskEvent(
+      taskId,
+      "queued",
+      `Seeded the initial greenfield implementation task from ${this.config.projectSpecPath}`
+    );
+    this.pendingManagerWakeReasons.add("greenfield_seeded");
+  }
+
+  private seededGreenfieldChecks(): string[] {
+    return [this.config.scripts.build, this.config.scripts.test, this.config.scripts.smoke].filter(
+      (script, index, allScripts) => !isPlaceholderScript(script) && allScripts.indexOf(script) === index
+    );
   }
 
   private async startQueuedTasksIfPossible(): Promise<void> {
@@ -1832,6 +1906,48 @@ class FactorySupervisor {
       await currentCommit(this.config.repoRoot, this.config.defaultBranch),
       await currentCommit(this.config.repoRoot, this.config.candidateBranch)
     );
+  }
+
+  private async persistBootstrapStatus(
+    status: FactoryProjectConfig["bootstrap"]["status"]
+  ): Promise<void> {
+    if (this.config.bootstrap.status === status) {
+      return;
+    }
+
+    this.config = {
+      ...this.config,
+      bootstrap: {
+        ...this.config.bootstrap,
+        status
+      }
+    };
+    await writeText(getConfigPath(this.config.repoRoot), renderFactoryConfig(this.config));
+    this.db.upsertProject(this.config);
+  }
+
+  private async listTrackedFilesForBootstrapDetection(): Promise<string[]> {
+    for (const ref of [this.config.candidateBranch, this.config.defaultBranch]) {
+      const result = await runCommand("git", ["ls-tree", "-r", "--name-only", ref], {
+        cwd: this.config.repoRoot,
+        allowNonZeroExit: true
+      });
+      if (result.exitCode === 0) {
+        return result.stdout
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0);
+      }
+    }
+
+    const fallback = await runCommand("git", ["ls-files"], {
+      cwd: this.config.repoRoot,
+      allowNonZeroExit: true
+    });
+    return fallback.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
   }
 
   private async startDashboardServer(): Promise<void> {

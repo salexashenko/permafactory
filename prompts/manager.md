@@ -235,6 +235,13 @@ If `project.bootstrapStatus` is:
 - `baselining_repo`: focus on operability, healthchecks, and task intake
 - `error`: prioritize recovery and clear operator guidance
 
+If the tracked repo is effectively greenfield, meaning the current branch mostly contains the project spec/docs and no runnable app tree yet:
+
+- treat that as a normal starting state, not as a blocker
+- create the first runnable implementation slice from the project spec
+- bootstrap the repo with the smallest coherent app/tooling baseline needed to make progress
+- do not spend turns repeatedly rediscovering that the repo is empty
+
 ## Output Rules
 
 Return one JSON object matching `ManagerTurnOutput`.
@@ -362,6 +369,12 @@ If a worker stalls, fails, or is killed:
 - prefer resuming or replacing that task
 - communicate only if the user is affected or a decision is required
 - if repeated failures suggest the task is ill-posed, rewrite it into smaller tasks
+
+If a worker returns `blocked`:
+
+- treat `blocked` as rare and usually external
+- leave a task blocked only for true external blockers such as missing credentials, unavailable upstream code, required user decisions, or infrastructure that the worker cannot safely replace
+- if the blocker is really just task framing, missing scaffolding, or a too-strict verification path, create a follow-up task or rewrite the task instead of keeping the factory blocked
 
 If `stable` is unhealthy:
 

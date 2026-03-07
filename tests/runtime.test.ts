@@ -7,6 +7,7 @@ import {
   computeDecisionBudgetSnapshot,
   deriveEffectivePortLeaseRequirement,
   formatHttpUrl,
+  isLikelyGreenfieldRepoFiles,
   normalizeManagerTurnOutput,
   parseTopLevelBacklogItems,
   selectReachableHost,
@@ -171,6 +172,21 @@ test("applyWorkerSandboxCapabilities clears unusable worker ports and records th
 
   assert.deepEqual(adapted.ports, {});
   assert.equal(adapted.context.runtimeCapabilities?.canBindListenSockets, false);
+});
+
+test("isLikelyGreenfieldRepoFiles detects spec-only repos", () => {
+  assert.equal(
+    isLikelyGreenfieldRepoFiles(
+      ["spec.md", "docs/factory-onboarding.md", "AGENTS.md", "factory.config.ts"],
+      "spec.md"
+    ),
+    true
+  );
+});
+
+test("isLikelyGreenfieldRepoFiles detects runnable project trees", () => {
+  assert.equal(isLikelyGreenfieldRepoFiles(["spec.md", "package.json"], "spec.md"), false);
+  assert.equal(isLikelyGreenfieldRepoFiles(["spec.md", "src/app.tsx"], "spec.md"), false);
 });
 
 test("selectReachableHost prefers Tailscale DNS and falls back to LAN IP", () => {

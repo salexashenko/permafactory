@@ -1010,6 +1010,104 @@ export function applyWorkerSandboxCapabilities(
   };
 }
 
+const RUNNABLE_PROJECT_SIGNAL_BASENAMES = new Set([
+  "package.json",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "bun.lockb",
+  "bun.lock",
+  "pyproject.toml",
+  "requirements.txt",
+  "setup.py",
+  "Cargo.toml",
+  "go.mod",
+  "pom.xml",
+  "build.gradle",
+  "build.gradle.kts",
+  "composer.json",
+  "gemfile",
+  "mix.exs",
+  "makefile",
+  "cmakelists.txt"
+]);
+
+const RUNNABLE_PROJECT_SIGNAL_EXTENSIONS = new Set([
+  ".html",
+  ".css",
+  ".scss",
+  ".sass",
+  ".less",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".ts",
+  ".tsx",
+  ".vue",
+  ".svelte",
+  ".astro",
+  ".py",
+  ".rs",
+  ".go",
+  ".java",
+  ".kt",
+  ".swift",
+  ".c",
+  ".cc",
+  ".cpp",
+  ".cs",
+  ".rb",
+  ".php",
+  ".elm"
+]);
+
+function isIgnorableGreenfieldBootstrapFile(file: string, projectSpecPath?: string): boolean {
+  const normalized = file.replace(/\\/g, "/");
+  const lower = normalized.toLowerCase();
+  const basename = path.basename(lower);
+  const projectSpecLower = projectSpecPath?.replace(/\\/g, "/").toLowerCase();
+
+  if (projectSpecLower && lower === projectSpecLower) {
+    return true;
+  }
+  if (lower === "factory.config.ts" || lower === "agents.md" || lower === ".env.factory.example") {
+    return true;
+  }
+  if (basename.startsWith("readme") || basename.startsWith("license")) {
+    return true;
+  }
+  if (/^docs\/.+\.md$/i.test(normalized)) {
+    return true;
+  }
+
+  return false;
+}
+
+function isRunnableProjectSignalFile(file: string): boolean {
+  const normalized = file.replace(/\\/g, "/");
+  const basename = path.basename(normalized).toLowerCase();
+  if (RUNNABLE_PROJECT_SIGNAL_BASENAMES.has(basename)) {
+    return true;
+  }
+
+  const extension = path.extname(basename);
+  return RUNNABLE_PROJECT_SIGNAL_EXTENSIONS.has(extension);
+}
+
+export function isLikelyGreenfieldRepoFiles(files: string[], projectSpecPath?: string): boolean {
+  const meaningfulFiles = files
+    .map((file) => file.trim())
+    .filter((file) => file.length > 0)
+    .filter((file) => !isIgnorableGreenfieldBootstrapFile(file, projectSpecPath));
+
+  if (meaningfulFiles.length === 0) {
+    return true;
+  }
+
+  return !meaningfulFiles.some((file) => isRunnableProjectSignalFile(file));
+}
+
 export function findLowestFreePort(
   start: number,
   end: number,
