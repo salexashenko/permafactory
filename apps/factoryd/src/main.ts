@@ -689,6 +689,9 @@ class FactorySupervisor {
     if (this.stopRequested) {
       return;
     }
+
+    await this.startQueuedTasksIfPossible();
+
     const resources = await this.sampleManagerResources();
     this.db.recordHealthSample(this.config.projectId, resources);
     await this.maybeSendDailyDigest(resources);
@@ -2431,6 +2434,19 @@ class FactorySupervisor {
       );
       return;
     }
+
+    if (this.stopRequested) {
+      return;
+    }
+
+    const runningWorkers = this.db
+      .listAgents(this.config.projectId)
+      .filter((agent) => agent.role !== "manager" && agent.status === "running").length;
+    if (runningWorkers >= this.config.scheduler.maxWorkers) {
+      return;
+    }
+
+    await this.startWorker(normalized, normalized.kind === "test" ? "test" : "code");
   }
 
   private async reconcileCompletedTaskBranches(): Promise<void> {
