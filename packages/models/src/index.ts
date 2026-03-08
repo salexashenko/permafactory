@@ -46,6 +46,11 @@ export type WorkerResultStatus = "completed" | "blocked" | "failed";
 export type CheckStatus = "passed" | "failed" | "not_run";
 export type ManagerToolName =
   | "get_factory_status"
+  | "inspect_branch_diff"
+  | "read_task_artifacts"
+  | "inspect_deploy_state"
+  | "inspect_factory_processes"
+  | "kill_factory_process"
   | "start_task"
   | "cancel_task"
   | "start_review"
@@ -244,6 +249,7 @@ export interface ManagerTurnInput {
       status: DeploymentStatus;
       url: string;
       commit: string;
+      branch?: string;
       activeSlot: "stable-a" | "stable-b";
       reason?: string;
       updatedAt?: string;
@@ -254,6 +260,7 @@ export interface ManagerTurnInput {
       status: DeploymentStatus;
       url: string;
       commit: string;
+      branch?: string;
       reason?: string;
       updatedAt?: string;
     };

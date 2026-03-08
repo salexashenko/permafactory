@@ -128,6 +128,48 @@ const replyUserSchema = z
   })
   .strict();
 
+const inspectBranchDiffSchema = z
+  .object({
+    branch: z.string().min(1),
+    baseBranch: z.string().min(1).optional(),
+    pathspecs: z.array(z.string().min(1)).max(50).optional(),
+    commit: z.string().min(1).optional()
+  })
+  .strict();
+
+const readTaskArtifactsSchema = z
+  .object({
+    taskId: z.string().min(1).optional(),
+    branch: z.string().min(1).optional(),
+    includeLogTailLines: z.number().int().min(0).max(200).optional()
+  })
+  .strict()
+  .refine((value) => Boolean(value.taskId || value.branch), {
+    message: "Either taskId or branch is required"
+  });
+
+const inspectDeployStateSchema = z
+  .object({
+    target: z.enum(["stable", "preview", "all"]).optional(),
+    includeLogTailLines: z.number().int().min(0).max(200).optional()
+  })
+  .strict();
+
+const inspectFactoryProcessesSchema = z
+  .object({
+    includeStaleOnly: z.boolean().optional(),
+    includeArgs: z.boolean().optional(),
+    limit: z.number().int().min(1).max(200).optional()
+  })
+  .strict();
+
+const killFactoryProcessSchema = z
+  .object({
+    pid: z.number().int().positive(),
+    force: z.boolean().optional()
+  })
+  .strict();
+
 async function callFactoryTool(
   toolName: ManagerToolName,
   requestId: string,
@@ -186,6 +228,56 @@ async function main(): Promise<void> {
         "Fetch a fresh factory snapshot after tool actions or when the initial turn input no longer reflects current repo state."
     },
     async (extra) => await runTool("get_factory_status", extra)
+  );
+
+  server.registerTool(
+    "inspect_branch_diff",
+    {
+      description:
+        "Inspect a branch against its base branch with commit, ahead/behind, file, and diff-stat facts.",
+      inputSchema: inspectBranchDiffSchema
+    },
+    async (args, extra) => await runTool("inspect_branch_diff", extra, args)
+  );
+
+  server.registerTool(
+    "read_task_artifacts",
+    {
+      description:
+        "Read the latest structured task outcome, recent task events, and recent run log tail for a task or branch.",
+      inputSchema: readTaskArtifactsSchema
+    },
+    async (args, extra) => await runTool("read_task_artifacts", extra, args)
+  );
+
+  server.registerTool(
+    "inspect_deploy_state",
+    {
+      description:
+        "Inspect stable/preview deployment identity, branches, runtime slot state, and recent runtime logs.",
+      inputSchema: inspectDeployStateSchema
+    },
+    async (args, extra) => await runTool("inspect_deploy_state", extra, args)
+  );
+
+  server.registerTool(
+    "inspect_factory_processes",
+    {
+      description:
+        "Inspect factory-owned processes, including active workers, app-server helpers, browser MCP processes, and stale resource leaks.",
+      inputSchema: inspectFactoryProcessesSchema
+    },
+    async (args, extra) => await runTool("inspect_factory_processes", extra, args)
+  );
+
+  server.registerTool(
+    "kill_factory_process",
+    {
+      description:
+        "Terminate a factory-owned process by pid when it is stale, leaking resources, or otherwise needs to be reaped.",
+      inputSchema: killFactoryProcessSchema
+    },
+    async (args, extra) => await runTool("kill_factory_process", extra, args)
   );
 
   server.registerTool(

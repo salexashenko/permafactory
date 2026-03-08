@@ -85,6 +85,11 @@ type RuntimeSlotName = "stable-a" | "stable-b" | "preview";
 
 const MANAGER_TOOL_NAMES: ReadonlySet<ManagerToolName> = new Set([
   "get_factory_status",
+  "inspect_branch_diff",
+  "read_task_artifacts",
+  "inspect_deploy_state",
+  "inspect_factory_processes",
+  "kill_factory_process",
   "start_task",
   "cancel_task",
   "start_review",
@@ -125,10 +130,47 @@ interface ResolvedRuntimeScripts {
   healthcheckScript: string;
 }
 
+interface RuntimeDeployIdentity {
+  target: "stable" | "preview";
+  slot: RuntimeSlotName;
+  commit: string;
+  branch?: string;
+  port: number;
+  url: string;
+  generatedAt: string;
+}
+
 interface RuntimeEnsureResult {
   ok: boolean;
   reason: "healthy" | "serve_script_not_configured" | "healthcheck_failed";
   scripts: ResolvedRuntimeScripts;
+}
+
+interface ProcessSnapshot {
+  pid: number;
+  ppid: number;
+  elapsedSeconds: number;
+  cpuPercent: number;
+  memoryPercent: number;
+  args: string;
+  command: string;
+}
+
+interface FactoryProcessRecord extends ProcessSnapshot {
+  kind:
+    | "supervisor"
+    | "app_server"
+    | "worker"
+    | "runtime"
+    | "manager_mcp"
+    | "browser_mcp"
+    | "chrome"
+    | "other";
+  ownerKind: "supervisor" | "manager" | "task" | "runtime" | "unknown";
+  ownerId?: string;
+  rootPid?: number;
+  active: boolean;
+  stale: boolean;
 }
 
 class InterruptedTurnError extends Error {
@@ -251,20 +293,30 @@ class AppServerClient {
     return () => this.notificationListeners.delete(listener);
   }
 
-  async request<T>(method: string, params: unknown): Promise<T> {
+  async request<T>(method: string, params: unknown, timeoutMs = 30_000): Promise<T> {
     await this.initialize();
-    return await this.sendRequest<T>(method, params);
+    return await this.sendRequest<T>(method, params, timeoutMs);
   }
 
-  private async sendRequest<T>(method: string, params: unknown): Promise<T> {
+  private async sendRequest<T>(method: string, params: unknown, timeoutMs = 30_000): Promise<T> {
     await this.connect();
     const id = this.requestId++;
     const payload = { jsonrpc: "2.0", id, method, params };
 
     const promise = new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Timed out waiting for ${method} response`));
+      }, timeoutMs);
       this.pending.set(id, {
-        resolve: (value) => resolve(value as T),
-        reject
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value as T);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        }
       });
     });
 
@@ -307,7 +359,7 @@ class AppServerClient {
   }
 
   async interruptTurn(threadId: string, turnId: string): Promise<void> {
-    await this.request("turn/interrupt", { threadId, turnId });
+    await this.request("turn/interrupt", { threadId, turnId }, 10_000);
   }
 
   async startTurn(
@@ -496,6 +548,8 @@ class FactorySupervisor {
     const appearsGreenfield = isLikelyGreenfieldRepoFiles(trackedFiles, this.config.projectSpecPath);
     await this.reconcileRuntimeTargets(appearsGreenfield);
     await this.reconcileStaleWorkers();
+    this.reconcileStaleManagerState();
+    await this.reconcileFactoryProcessLeaks();
     await this.reconcileCompletedTaskBranches();
 
     const expiredDecisions = this.db.expireTimedOutDecisions();
@@ -565,6 +619,10 @@ class FactorySupervisor {
     this.managerRunning = true;
     const wakeReasons = [...this.pendingManagerWakeReasons];
     this.pendingManagerWakeReasons.clear();
+    if (this.shouldRotateManagerThreadFromRecentTurns()) {
+      this.managerThreadNeedsRotation = true;
+      wakeReasons.push("manager_thread_rotation");
+    }
 
     try {
       await this.ensureAppServer();
@@ -678,9 +736,10 @@ class FactorySupervisor {
   private async recoverManagerFailure(error: unknown): Promise<boolean> {
     const message = error instanceof Error ? error.message : String(error);
     const shouldInterruptTurn = /Timed out waiting for turn/i.test(message);
-    const shouldResetTransport = /Timed out waiting for turn|Not initialized|socket closed|Failed connecting/i.test(
-      message
-    );
+    const shouldResetTransport =
+      /Timed out waiting for turn|Timed out waiting for .* response|Not initialized|socket closed|Failed connecting/i.test(
+        message
+      );
 
     if (shouldInterruptTurn && this.activeManagerThreadId && this.activeManagerTurnId) {
       try {
@@ -692,10 +751,52 @@ class FactorySupervisor {
 
     if (shouldResetTransport) {
       await this.resetManagerTransport();
+      this.managerThreadNeedsRotation = true;
       return true;
     }
 
     return false;
+  }
+
+  private shouldRotateManagerThreadFromRecentTurns(): boolean {
+    const recentTurns = this.db.listRecentManagerTurns(this.config.projectId, 4);
+    if (recentTurns.length < 3) {
+      return false;
+    }
+
+    const normalizedSummaries = new Set(
+      recentTurns.slice(0, 3).map((turn) => this.normalizeManagerLoopSummary(turn.summary))
+    );
+    const repeatedNoOpLoop =
+      recentTurns.slice(0, 3).every((turn) => this.isNoOpManagerTurn(turn)) &&
+      normalizedSummaries.size === 1;
+    const repeatedMismatchLoop = recentTurns
+      .slice(0, 3)
+      .every((turn) => turn.toolCalls.length === 0 && turn.mismatchHints.length > 0);
+
+    return repeatedNoOpLoop || repeatedMismatchLoop;
+  }
+
+  private isNoOpManagerTurn(turn: ManagerTurnInput["recentManagerTurns"][number]): boolean {
+    const totalActions =
+      turn.actionCounts.tasksToStart +
+      turn.actionCounts.tasksToCancel +
+      turn.actionCounts.reviewsToStart +
+      turn.actionCounts.integrations +
+      turn.actionCounts.deployments +
+      turn.actionCounts.decisions +
+      turn.actionCounts.userMessages;
+    return totalActions === 0 && turn.toolCalls.length === 0;
+  }
+
+  private normalizeManagerLoopSummary(summary: string): string {
+    return summary
+      .replace(/`[^`]+`/g, "`ref`")
+      .replace(/\b[0-9a-f]{8,40}\b/gi, "sha")
+      .replace(/\d+/g, "n")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
   }
 
   private async buildManagerInstructions(): Promise<string> {
@@ -1065,6 +1166,345 @@ class FactorySupervisor {
     }
   }
 
+  private reconcileStaleManagerState(): void {
+    if (this.managerRunning) {
+      return;
+    }
+
+    const manager = this.db.listAgents(this.config.projectId).find((agent) => agent.role === "manager");
+    if (!manager || manager.status !== "running") {
+      return;
+    }
+
+    this.db.upsertAgent({
+      id: manager.id,
+      projectId: manager.projectId,
+      role: "manager",
+      status: "stalled",
+      threadId: manager.threadId,
+      metadata: {
+        ...manager.metadata,
+        recoveredAt: nowIso(),
+        recoveredReason: "stale_manager_state"
+      }
+    });
+    this.activeManagerThreadId = manager.threadId;
+    this.activeManagerTurnId = undefined;
+    this.managerThreadNeedsRotation = true;
+    this.pendingManagerWakeReasons.add("manager_recovered");
+    console.warn(
+      `Recovered stale manager state${manager.threadId ? ` for thread ${manager.threadId}` : ""}; scheduling a fresh manager turn`
+    );
+  }
+
+  private async reconcileFactoryProcessLeaks(): Promise<void> {
+    if (this.managerRunning || this.activeManagerTurnId) {
+      return;
+    }
+
+    const appServerPid = await this.findListenerPidForUrl(this.config.codex.appServerUrl);
+    const keepRootPids = new Set<number>();
+    if (this.appServerProcess?.pid && this.isProcessAlive(this.appServerProcess.pid)) {
+      keepRootPids.add(this.appServerProcess.pid);
+    }
+    for (const child of this.workerChildren.values()) {
+      if (child.pid && this.isProcessAlive(child.pid)) {
+        keepRootPids.add(child.pid);
+      }
+    }
+    for (const runtime of this.runtimeProcesses.values()) {
+      if (runtime.child.pid && this.isProcessAlive(runtime.child.pid)) {
+        keepRootPids.add(runtime.child.pid);
+      }
+    }
+
+    if (appServerPid && !keepRootPids.has(appServerPid)) {
+      await this.terminateProcessTree(appServerPid);
+      this.appServerClient?.dispose();
+      this.appServerClient = undefined;
+      console.warn(`Killed stale app-server listener pid ${appServerPid}`);
+      return;
+    }
+
+    const processes = await this.listFactoryProcesses({ includeArgs: true, limit: 400 });
+    const staleRoots = new Set<number>();
+    for (const processInfo of processes) {
+      if (!processInfo.stale) {
+        continue;
+      }
+      if (processInfo.kind !== "browser_mcp" && processInfo.kind !== "chrome" && processInfo.kind !== "manager_mcp") {
+        continue;
+      }
+      if (processInfo.elapsedSeconds < 60) {
+        continue;
+      }
+      staleRoots.add(processInfo.rootPid ?? processInfo.pid);
+    }
+
+    for (const pid of staleRoots) {
+      await this.terminateProcessTree(pid);
+      console.warn(`Reaped stale factory process tree rooted at pid ${pid}`);
+    }
+  }
+
+  private async ensureOwnedAppServerListener(): Promise<void> {
+    const listenerPid = await this.findListenerPidForUrl(this.config.codex.appServerUrl);
+    if (!listenerPid) {
+      return;
+    }
+
+    if (this.appServerProcess?.pid === listenerPid && this.isProcessAlive(listenerPid)) {
+      return;
+    }
+
+    await this.terminateProcessTree(listenerPid);
+    this.appServerClient?.dispose();
+    this.appServerClient = undefined;
+    console.warn(`Reclaimed app-server port by killing stale listener pid ${listenerPid}`);
+  }
+
+  private async findListenerPidForUrl(urlText: string): Promise<number | undefined> {
+    let port: number | undefined;
+    try {
+      const url = new URL(urlText);
+      port = Number.parseInt(url.port, 10);
+    } catch {
+      return undefined;
+    }
+
+    if (!port || !Number.isFinite(port)) {
+      return undefined;
+    }
+
+    const result = await runCommand("ss", ["-ltnp", `( sport = :${port} )`], {
+      cwd: this.config.repoRoot,
+      allowNonZeroExit: true
+    }).catch(() => ({ stdout: "", stderr: "", exitCode: 1 }));
+    const pidMatch = result.stdout.match(/pid=(\d+)/);
+    return pidMatch ? Number.parseInt(pidMatch[1] ?? "", 10) : undefined;
+  }
+
+  private async listSystemProcesses(): Promise<ProcessSnapshot[]> {
+    const result = await runCommand(
+      "ps",
+      ["-eo", "pid=,ppid=,etimes=,%cpu=,%mem=,args="],
+      {
+        cwd: this.config.repoRoot,
+        allowNonZeroExit: true
+      }
+    );
+    return result.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .map((line) => {
+        const match = line.match(/^(\d+)\s+(\d+)\s+(\d+)\s+([0-9.]+)\s+([0-9.]+)\s+(.+)$/);
+        if (!match) {
+          return undefined;
+        }
+        const [, pidText, ppidText, elapsedText, cpuText, memText, args] = match;
+        const argsText = args ?? "";
+        return {
+          pid: Number.parseInt(pidText ?? "", 10),
+          ppid: Number.parseInt(ppidText ?? "", 10),
+          elapsedSeconds: Number.parseInt(elapsedText ?? "", 10),
+          cpuPercent: Number.parseFloat(cpuText ?? "0") || 0,
+          memoryPercent: Number.parseFloat(memText ?? "0") || 0,
+          args: argsText,
+          command: argsText.split(/\s+/, 1)[0] ?? argsText
+        } satisfies ProcessSnapshot;
+      })
+      .filter((entry): entry is ProcessSnapshot => Boolean(entry));
+  }
+
+  private collectDescendantPids(rootPid: number, childrenByParent: Map<number, number[]>): Set<number> {
+    const seen = new Set<number>([rootPid]);
+    const queue = [rootPid];
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (current === undefined) {
+        continue;
+      }
+      for (const childPid of childrenByParent.get(current) ?? []) {
+        if (seen.has(childPid)) {
+          continue;
+        }
+        seen.add(childPid);
+        queue.push(childPid);
+      }
+    }
+    return seen;
+  }
+
+  private async listFactoryProcesses(options: {
+    includeArgs?: boolean;
+    includeStaleOnly?: boolean;
+    limit?: number;
+  } = {}): Promise<FactoryProcessRecord[]> {
+    const processes = await this.listSystemProcesses();
+    const byPid = new Map(processes.map((entry) => [entry.pid, entry]));
+    const childrenByParent = new Map<number, number[]>();
+    for (const processInfo of processes) {
+      const siblings = childrenByParent.get(processInfo.ppid) ?? [];
+      siblings.push(processInfo.pid);
+      childrenByParent.set(processInfo.ppid, siblings);
+    }
+
+    const activeWorkerRoots = new Map<number, string>();
+    for (const [taskId, child] of this.workerChildren.entries()) {
+      if (child.pid && this.isProcessAlive(child.pid)) {
+        activeWorkerRoots.set(child.pid, taskId);
+      }
+    }
+    const runtimeRoots = new Map<number, RuntimeSlotName>();
+    for (const [slot, runtime] of this.runtimeProcesses.entries()) {
+      if (runtime.child.pid && this.isProcessAlive(runtime.child.pid)) {
+        runtimeRoots.set(runtime.child.pid, slot);
+      }
+    }
+
+    const appServerPid = await this.findListenerPidForUrl(this.config.codex.appServerUrl);
+    const currentAppServerPid =
+      this.appServerProcess?.pid && this.isProcessAlive(this.appServerProcess.pid)
+        ? this.appServerProcess.pid
+        : undefined;
+    const knownRoots = new Set<number>([
+      process.pid,
+      ...(appServerPid ? [appServerPid] : []),
+      ...activeWorkerRoots.keys(),
+      ...runtimeRoots.keys()
+    ]);
+
+    const descendantToRoot = new Map<number, number>();
+    for (const rootPid of knownRoots) {
+      for (const pid of this.collectDescendantPids(rootPid, childrenByParent)) {
+        if (!descendantToRoot.has(pid)) {
+          descendantToRoot.set(pid, rootPid);
+        }
+      }
+    }
+
+    const candidateProcesses = processes.filter((processInfo) => {
+      if (descendantToRoot.has(processInfo.pid)) {
+        return true;
+      }
+      if (
+        processInfo.args.includes("chrome-devtools-mcp") ||
+        processInfo.args.includes("apps/factory-manager-mcp/src/main.ts") ||
+        (processInfo.args.includes("/opt/google/chrome/chrome") &&
+          processInfo.args.includes("puppeteer_dev_chrome_profile")) ||
+        (processInfo.args.includes("codex app-server") &&
+          processInfo.args.includes(this.config.codex.appServerUrl))
+      ) {
+        return true;
+      }
+      return false;
+    });
+
+    const records = candidateProcesses.map((processInfo) => {
+      const rootPid = descendantToRoot.get(processInfo.pid) ?? processInfo.pid;
+      const rootProcess = byPid.get(rootPid);
+      let kind: FactoryProcessRecord["kind"] = "other";
+      let ownerKind: FactoryProcessRecord["ownerKind"] = "unknown";
+      let ownerId: string | undefined;
+      let active = false;
+
+      if (processInfo.pid === process.pid) {
+        kind = "supervisor";
+        ownerKind = "supervisor";
+        ownerId = this.config.projectId;
+        active = true;
+      } else if ((processInfo.pid === appServerPid || rootPid === appServerPid) && appServerPid) {
+        kind = processInfo.args.includes("chrome-devtools-mcp")
+          ? "browser_mcp"
+          : processInfo.args.includes("apps/factory-manager-mcp/src/main.ts")
+            ? "manager_mcp"
+            : processInfo.args.includes("/opt/google/chrome/chrome")
+              ? "chrome"
+              : "app_server";
+        ownerKind = "manager";
+        ownerId = "manager";
+        active = this.managerRunning || this.activeManagerTurnId !== undefined;
+      } else if (activeWorkerRoots.has(rootPid)) {
+        kind = processInfo.args.includes("chrome-devtools-mcp")
+          ? "browser_mcp"
+          : processInfo.args.includes("/opt/google/chrome/chrome")
+            ? "chrome"
+            : "worker";
+        ownerKind = "task";
+        ownerId = activeWorkerRoots.get(rootPid);
+        active = true;
+      } else if (runtimeRoots.has(rootPid)) {
+        kind = "runtime";
+        ownerKind = "runtime";
+        ownerId = runtimeRoots.get(rootPid);
+        active = true;
+      } else if (processInfo.args.includes("chrome-devtools-mcp")) {
+        kind = "browser_mcp";
+      } else if (processInfo.args.includes("apps/factory-manager-mcp/src/main.ts")) {
+        kind = "manager_mcp";
+      } else if (processInfo.args.includes("/opt/google/chrome/chrome")) {
+        kind = "chrome";
+      } else if (processInfo.args.includes("codex app-server") && processInfo.args.includes(this.config.codex.appServerUrl)) {
+        kind = "app_server";
+      }
+
+      const stale =
+        !active &&
+        (kind === "app_server" || kind === "manager_mcp" || kind === "browser_mcp" || kind === "chrome");
+
+      return {
+        ...processInfo,
+        args: options.includeArgs === false ? processInfo.command : processInfo.args,
+        kind,
+        ownerKind,
+        ownerId,
+        rootPid,
+        active,
+        stale:
+          stale ||
+          (kind === "app_server" &&
+            processInfo.pid === appServerPid &&
+            currentAppServerPid !== undefined &&
+            processInfo.pid !== currentAppServerPid)
+      } satisfies FactoryProcessRecord;
+    });
+
+    const filtered = options.includeStaleOnly ? records.filter((record) => record.stale) : records;
+    return filtered
+      .sort((left, right) => right.cpuPercent - left.cpuPercent || right.elapsedSeconds - left.elapsedSeconds)
+      .slice(0, options.limit ?? 100);
+  }
+
+  private async terminateProcessTree(pid: number): Promise<void> {
+    const processes = await this.listSystemProcesses();
+    const childrenByParent = new Map<number, number[]>();
+    for (const processInfo of processes) {
+      const children = childrenByParent.get(processInfo.ppid) ?? [];
+      children.push(processInfo.pid);
+      childrenByParent.set(processInfo.ppid, children);
+    }
+    const descendants = [...this.collectDescendantPids(pid, childrenByParent)].sort((left, right) => right - left);
+    for (const targetPid of descendants) {
+      try {
+        process.kill(targetPid, "SIGTERM");
+      } catch {
+        // Ignore dead processes while reaping.
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    for (const targetPid of descendants) {
+      if (!this.isProcessAlive(targetPid)) {
+        continue;
+      }
+      try {
+        process.kill(targetPid, "SIGKILL");
+      } catch {
+        // Ignore dead processes while reaping.
+      }
+    }
+  }
+
   private isProcessAlive(pid: number): boolean {
     try {
       process.kill(pid, 0);
@@ -1121,6 +1561,13 @@ class FactorySupervisor {
 
       const args = call.args ?? {};
       switch (call.toolName) {
+        case "inspect_branch_diff":
+        case "read_task_artifacts":
+        case "inspect_deploy_state":
+        case "inspect_factory_processes":
+        case "kill_factory_process":
+        case "get_factory_status":
+          break;
         case "start_task":
           if (typeof args.id === "string" && typeof args.branchName === "string") {
             preview.tasksToStart.push(`${args.id}:${args.branchName}`);
@@ -1166,8 +1613,6 @@ class FactorySupervisor {
             preview.userMessages.push(`${args.kind}:${args.text.slice(0, 80)}`);
           }
           break;
-        case "get_factory_status":
-          break;
       }
     }
 
@@ -1196,6 +1641,33 @@ class FactorySupervisor {
     const args = call.args ?? {};
     let subject = "";
     switch (call.toolName) {
+      case "inspect_branch_diff":
+        if (typeof args.branch === "string") {
+          subject = `:${args.branch}->${typeof args.baseBranch === "string" ? args.baseBranch : "default"}`;
+        }
+        break;
+      case "read_task_artifacts":
+        if (typeof args.taskId === "string") {
+          subject = `:${args.taskId}`;
+        } else if (typeof args.branch === "string") {
+          subject = `:${args.branch}`;
+        }
+        break;
+      case "inspect_deploy_state":
+        if (typeof args.target === "string") {
+          subject = `:${args.target}`;
+        }
+        break;
+      case "inspect_factory_processes":
+        if (args.includeStaleOnly === true) {
+          subject = ":stale";
+        }
+        break;
+      case "kill_factory_process":
+        if (typeof args.pid === "number") {
+          subject = `:${args.pid}`;
+        }
+        break;
       case "start_task":
         if (typeof args.id === "string" && typeof args.branchName === "string") {
           subject = `:${args.id}:${args.branchName}`;
@@ -1341,6 +1813,44 @@ class FactorySupervisor {
         const snapshot = await this.buildManagerInput(resources);
         return { snapshot: JSON.parse(JSON.stringify(snapshot)) as Record<string, unknown> };
       }
+      case "inspect_branch_diff": {
+        return await this.inspectBranchDiff(args);
+      }
+      case "read_task_artifacts": {
+        return await this.readTaskArtifacts(args);
+      }
+      case "inspect_deploy_state": {
+        return await this.inspectDeployState(args);
+      }
+      case "inspect_factory_processes": {
+        const includeStaleOnly = Boolean(args.includeStaleOnly);
+        const includeArgs = args.includeArgs !== false;
+        const limit =
+          typeof args.limit === "number" ? Math.max(1, Math.min(200, Math.trunc(args.limit))) : 100;
+        return {
+          processes: await this.listFactoryProcesses({ includeStaleOnly, includeArgs, limit })
+        };
+      }
+      case "kill_factory_process": {
+        const pid = Number(args.pid);
+        if (!Number.isInteger(pid) || pid <= 0) {
+          throw new Error("Missing required integer argument: pid");
+        }
+        const inventory = await this.listFactoryProcesses({ includeArgs: true, limit: 500 });
+        const target = inventory.find((processInfo) => processInfo.pid === pid);
+        if (!target) {
+          throw new Error(`Refused to kill pid ${pid}; it is not currently recognized as a factory-owned process`);
+        }
+        await this.terminateProcessTree(pid);
+        return {
+          pid,
+          kind: target.kind,
+          ownerKind: target.ownerKind,
+          ownerId: target.ownerId,
+          stale: target.stale,
+          alive: this.isProcessAlive(pid)
+        };
+      }
       case "start_task": {
         const contract = args as unknown as TaskContract;
         await this.materializeAndStartTask(contract);
@@ -1431,6 +1941,156 @@ class FactorySupervisor {
     }
 
     throw new Error(`Unknown manager tool: ${String(toolName)}`);
+  }
+
+  private async inspectBranchDiff(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const branch = this.requireStringArg(args, "branch");
+    const baseBranch =
+      (typeof args.baseBranch === "string" && args.baseBranch.length > 0
+        ? args.baseBranch
+        : this.findTaskByBranch(branch)?.baseBranch) ?? this.config.candidateBranch;
+    const expectedCommit = typeof args.commit === "string" ? args.commit : undefined;
+    const pathspecs = Array.isArray(args.pathspecs)
+      ? args.pathspecs.filter((value): value is string => typeof value === "string" && value.length > 0)
+      : [];
+    const branchHead = await currentCommit(this.config.repoRoot, branch);
+    if (expectedCommit && branchHead !== expectedCommit) {
+      throw new Error(
+        `Branch ${branch} is at ${branchHead.slice(0, 12)}, not ${expectedCommit.slice(0, 12)}`
+      );
+    }
+    const baseHead = await currentCommit(this.config.repoRoot, baseBranch);
+    const aheadByResult = await runCommand(
+      "git",
+      ["rev-list", "--count", `${baseBranch}..${branch}`],
+      { cwd: this.config.repoRoot, allowNonZeroExit: true }
+    );
+    const behindByResult = await runCommand(
+      "git",
+      ["rev-list", "--count", `${branch}..${baseBranch}`],
+      { cwd: this.config.repoRoot, allowNonZeroExit: true }
+    );
+    const diffArgs = ["diff", "--stat=120", `${baseBranch}..${branch}`];
+    const nameStatusArgs = ["diff", "--name-status", `${baseBranch}..${branch}`];
+    const logArgs = ["log", "--oneline", "--no-merges", `${baseBranch}..${branch}`, "-n", "10"];
+    if (pathspecs.length > 0) {
+      diffArgs.push("--", ...pathspecs);
+      nameStatusArgs.push("--", ...pathspecs);
+    }
+    const [diffStat, changedFiles, commitLog] = await Promise.all([
+      runCommand("git", diffArgs, { cwd: this.config.repoRoot, allowNonZeroExit: true }),
+      runCommand("git", nameStatusArgs, { cwd: this.config.repoRoot, allowNonZeroExit: true }),
+      runCommand("git", logArgs, { cwd: this.config.repoRoot, allowNonZeroExit: true })
+    ]);
+
+    return {
+      branch,
+      baseBranch,
+      branchHead,
+      baseHead,
+      aheadBy: Number.parseInt(aheadByResult.stdout.trim() || "0", 10) || 0,
+      behindBy: Number.parseInt(behindByResult.stdout.trim() || "0", 10) || 0,
+      changedFiles: changedFiles.stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+        .slice(0, 100),
+      diffStat: diffStat.stdout.trim(),
+      commitLog: commitLog.stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+    };
+  }
+
+  private async readTaskArtifacts(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const task =
+      (typeof args.taskId === "string" ? this.db.getTask(args.taskId) : undefined) ??
+      (typeof args.branch === "string" ? this.findTaskByBranch(args.branch) : undefined);
+    if (!task) {
+      throw new Error(`Unknown task target ${String(args.taskId ?? args.branch ?? "unknown")}`);
+    }
+
+    const includeLogTailLines =
+      typeof args.includeLogTailLines === "number" ? Math.max(0, Math.min(200, args.includeLogTailLines)) : 40;
+    const runs = this.db
+      .listRuns(this.config.projectId)
+      .filter((run) => run.taskId === task.id)
+      .slice(0, 3);
+    const latestEvent = this.getLatestTaskEvent(task.id);
+
+    const runArtifacts = await Promise.all(
+      runs.map(async (run) => {
+        const rawFinal =
+          (await readText(run.finalMessagePath).catch(() => undefined)) ??
+          (await this.readLastAgentMessageFromJsonl(run.jsonlLogPath).catch(() => undefined));
+        let parsedFinal: Record<string, unknown> | string | undefined;
+        if (rawFinal) {
+          try {
+            parsedFinal = JSON.parse(rawFinal) as Record<string, unknown>;
+          } catch {
+            parsedFinal = rawFinal;
+          }
+        }
+
+        return {
+          id: run.id,
+          role: run.role,
+          status: run.status,
+          startedAt: run.startedAt,
+          finishedAt: run.finishedAt,
+          final: parsedFinal,
+          logTail: await this.readFileTail(run.jsonlLogPath, includeLogTailLines),
+          stderrTail: await this.readFileTail(path.join(run.runDirectory, "stderr.log"), includeLogTailLines)
+        };
+      })
+    );
+
+    return {
+      task: {
+        id: task.id,
+        title: task.title,
+        status: task.status,
+        branchName: task.branchName,
+        baseBranch: task.baseBranch,
+        worktreePath: task.worktreePath,
+        latestEvent
+      },
+      runs: runArtifacts
+    };
+  }
+
+  private async inspectDeployState(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const target =
+      typeof args.target === "string" && ["stable", "preview", "all"].includes(args.target)
+        ? (args.target as "stable" | "preview" | "all")
+        : "all";
+    const includeLogTailLines =
+      typeof args.includeLogTailLines === "number" ? Math.max(0, Math.min(200, args.includeLogTailLines)) : 40;
+    const snapshot = this.db.getDeploymentSnapshot(this.config.projectId);
+
+    return {
+      requestedTarget: target,
+      deployments:
+        target === "stable"
+          ? { stable: snapshot.stable }
+          : target === "preview"
+            ? { preview: snapshot.preview }
+            : snapshot,
+      runtimeProcesses:
+        target === "stable"
+          ? {
+              stable: await this.inspectRuntimeSlotState(snapshot.stable.activeSlot, includeLogTailLines)
+            }
+          : target === "preview"
+            ? {
+                preview: await this.inspectRuntimeSlotState("preview", includeLogTailLines)
+              }
+            : {
+                stable: await this.inspectRuntimeSlotState(snapshot.stable.activeSlot, includeLogTailLines),
+                preview: await this.inspectRuntimeSlotState("preview", includeLogTailLines)
+              }
+    };
   }
 
   private requireStringArg(args: Record<string, unknown>, key: string): string {
@@ -1696,7 +2356,7 @@ class FactorySupervisor {
       worktreePath: review.worktreePath || task.worktreePath || task.contract.worktreePath,
       needsPreview: false,
       ports: {},
-      runtime: { maxRuntimeMinutes: 30, reasoningEffort: "medium" },
+      runtime: { maxRuntimeMinutes: 60, reasoningEffort: "medium" },
       constraints: {
         ...task.contract.constraints,
         mustRunChecks: []
@@ -1757,6 +2417,32 @@ class FactorySupervisor {
       .filter((line) => line.length > 0)
       .map((line) => line.slice(3).split(" -> ").at(-1)?.trim() ?? "")
       .filter((file) => file.length > 0 && file !== ".factory.env");
+  }
+
+  private getLatestTaskEvent(taskId: string): { at: string; type: string; summary: string; payload?: Record<string, unknown> } | undefined {
+    const latestTaskEvent = this.db.getLatestTaskEvent(taskId);
+    return latestTaskEvent
+      ? {
+          at: latestTaskEvent.at,
+          type: latestTaskEvent.type,
+          summary: latestTaskEvent.summary,
+          payload: latestTaskEvent.payload
+        }
+      : undefined;
+  }
+
+  private async readFileTail(filePath: string, maxLines: number): Promise<string[]> {
+    if (maxLines <= 0) {
+      return [];
+    }
+    const raw = await readText(filePath).catch(() => undefined);
+    if (!raw) {
+      return [];
+    }
+    return raw
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0)
+      .slice(-maxLines);
   }
 
   private async integrateRequest(integration: IntegrationRequest): Promise<void> {
@@ -2468,6 +3154,7 @@ class FactorySupervisor {
     await this.stopRuntimeProcess(slot);
     await this.stopOrphanRuntimeListeners(port);
     const scripts = await this.prepareRuntimeWorktree(slot, commit, port);
+    const deployIdentity = await this.buildRuntimeDeployIdentity(slot, commit, port);
     if (isPlaceholderScript(scripts.serveScript)) {
       return {
         ok: false,
@@ -2481,7 +3168,7 @@ class FactorySupervisor {
     const started = await spawnLoggedShellCommand({
       script: scripts.serveScript,
       cwd: worktreePath,
-      env: this.buildRuntimeEnvironment(port),
+      env: this.buildRuntimeEnvironment(port, deployIdentity),
       stdoutPath,
       stderrPath
     });
@@ -2626,14 +3313,109 @@ class FactorySupervisor {
         env: this.buildRuntimeEnvironment(port)
       });
     }
+    await this.writeRuntimeDeployIdentity(slot, commit, port, worktreePath);
     return scripts;
   }
 
-  private buildRuntimeEnvironment(port: number): NodeJS.ProcessEnv {
+  private buildRuntimeEnvironment(
+    port: number,
+    deployIdentity?: RuntimeDeployIdentity
+  ): NodeJS.ProcessEnv {
     return {
       ...process.env,
       PORT: String(port),
-      FACTORY_APP_PORT: String(port)
+      FACTORY_APP_PORT: String(port),
+      ...(deployIdentity
+        ? {
+            PERMAFACTORY_DEPLOY_TARGET: deployIdentity.target,
+            PERMAFACTORY_DEPLOY_SLOT: deployIdentity.slot,
+            PERMAFACTORY_DEPLOY_COMMIT: deployIdentity.commit,
+            ...(deployIdentity.branch ? { PERMAFACTORY_DEPLOY_BRANCH: deployIdentity.branch } : {}),
+            PERMAFACTORY_DEPLOY_URL: deployIdentity.url
+          }
+        : {})
+    };
+  }
+
+  private async buildRuntimeDeployIdentity(
+    slot: RuntimeSlotName,
+    commit: string,
+    port: number
+  ): Promise<RuntimeDeployIdentity> {
+    const target = slot === "preview" ? "preview" : "stable";
+    const branch = await this.resolveDeployedBranch(target, commit);
+    return {
+      target,
+      slot,
+      commit,
+      branch,
+      port,
+      url: await resolveReachableHttpUrl(target === "preview" ? this.config.ports.preview : this.config.ports.stableProxy),
+      generatedAt: nowIso()
+    };
+  }
+
+  private async resolveDeployedBranch(
+    target: "stable" | "preview",
+    commit: string
+  ): Promise<string | undefined> {
+    const preferredBranch = target === "preview" ? this.config.candidateBranch : this.config.defaultBranch;
+    const preferredHead = await currentCommit(this.config.repoRoot, preferredBranch).catch(() => undefined);
+    if (preferredHead === commit) {
+      return preferredBranch;
+    }
+
+    const containingBranches = await runCommand(
+      "git",
+      ["for-each-ref", "--format=%(refname:short)", `--contains=${commit}`, "refs/heads"],
+      {
+        cwd: this.config.repoRoot,
+        allowNonZeroExit: true
+      }
+    );
+    const branches = containingBranches.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    return branches.includes(preferredBranch) ? preferredBranch : branches[0];
+  }
+
+  private async writeRuntimeDeployIdentity(
+    slot: RuntimeSlotName,
+    commit: string,
+    port: number,
+    worktreePath: string
+  ): Promise<RuntimeDeployIdentity> {
+    const identity = await this.buildRuntimeDeployIdentity(slot, commit, port);
+    const payload = `${JSON.stringify(identity, null, 2)}\n`;
+    const relativePath = path.join("__permafactory", "deploy-state.json");
+    const candidatePaths = [path.join(worktreePath, relativePath)];
+    if (await fileExists(path.join(worktreePath, "dist"))) {
+      candidatePaths.push(path.join(worktreePath, "dist", relativePath));
+    }
+    for (const candidatePath of candidatePaths) {
+      await writeText(candidatePath, payload).catch(() => undefined);
+    }
+    return identity;
+  }
+
+  private async inspectRuntimeSlotState(
+    slot: RuntimeSlotName,
+    includeLogTailLines: number
+  ): Promise<Record<string, unknown>> {
+    const current = this.runtimeProcesses.get(slot);
+    const stdoutPath = path.join(this.paths.logsDir, `${slot}.out.log`);
+    const stderrPath = path.join(this.paths.logsDir, `${slot}.err.log`);
+    return {
+      slot,
+      port: this.runtimeSlotPort(slot),
+      pid: current?.child.pid,
+      commit: current?.commit,
+      worktreePath: current?.worktreePath,
+      serveScript: current?.script,
+      healthcheckScript: current?.healthcheckScript,
+      stdoutTail: await this.readFileTail(stdoutPath, includeLogTailLines),
+      stderrTail: await this.readFileTail(stderrPath, includeLogTailLines)
     };
   }
 
@@ -2744,6 +3526,18 @@ class FactorySupervisor {
       return;
     }
 
+    const deployIdentity = await this.buildRuntimeDeployIdentity(
+      target.slot,
+      this.db.getDeploymentSnapshot(this.config.projectId).stable.commit,
+      this.config.ports.stableProxy
+    );
+    const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (requestUrl.pathname === "/__permafactory/deploy-state.json") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(`${JSON.stringify(deployIdentity, null, 2)}\n`);
+      return;
+    }
+
     const proxyRequest = http.request(
       {
         host: "127.0.0.1",
@@ -2756,7 +3550,13 @@ class FactorySupervisor {
         }
       },
       (proxyResponse) => {
-        response.writeHead(proxyResponse.statusCode ?? 502, proxyResponse.headers);
+        response.writeHead(proxyResponse.statusCode ?? 502, {
+          ...proxyResponse.headers,
+          "x-permafactory-deploy-target": deployIdentity.target,
+          "x-permafactory-deploy-slot": deployIdentity.slot,
+          "x-permafactory-deploy-commit": deployIdentity.commit,
+          ...(deployIdentity.branch ? { "x-permafactory-deploy-branch": deployIdentity.branch } : {})
+        });
         proxyResponse.pipe(response);
       }
     );
@@ -2882,6 +3682,7 @@ class FactorySupervisor {
   }
 
   private async ensureAppServer(): Promise<void> {
+    await this.ensureOwnedAppServerListener();
     const url = this.config.codex.appServerUrl;
     try {
       const client = this.getAppServerClient();
@@ -2912,6 +3713,10 @@ class FactorySupervisor {
 
     if (!this.appServerProcess || this.appServerProcess.exitCode !== null) {
       this.appServerProcess = undefined;
+      const listenerPid = await this.findListenerPidForUrl(this.config.codex.appServerUrl);
+      if (listenerPid) {
+        await this.terminateProcessTree(listenerPid);
+      }
       return;
     }
 
@@ -3048,6 +3853,14 @@ class FactorySupervisor {
               null,
               2
             )
+          );
+          return;
+        }
+
+        if (request.method === "GET" && url.pathname === "/deploy-state") {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(
+            JSON.stringify(await this.inspectDeployState({ target: "all", includeLogTailLines: 20 }), null, 2)
           );
           return;
         }

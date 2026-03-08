@@ -621,6 +621,32 @@ export class FactoryDatabase {
       .run(taskId, nowIso(), type, summary, serializeJson(payload));
   }
 
+  getLatestTaskEvent(
+    taskId: string
+  ): { at: string; type: string; summary: string; payload: Record<string, unknown> } | undefined {
+    const row = this.db
+      .prepare(
+        `
+          SELECT at, type, summary, payload_json
+          FROM task_events
+          WHERE task_id = ?
+          ORDER BY at DESC
+          LIMIT 1
+        `
+      )
+      .get(taskId) as Record<string, unknown> | undefined;
+    if (!row) {
+      return undefined;
+    }
+
+    return {
+      at: String(row.at),
+      type: String(row.type),
+      summary: String(row.summary),
+      payload: parseJson<Record<string, unknown>>(row.payload_json, {})
+    };
+  }
+
   listRecentEvents(projectId: string, limit = 20): Array<{ at: string; type: string; summary: string }> {
     const rows = this.db
       .prepare(
@@ -1280,6 +1306,7 @@ export class FactoryDatabase {
   }
 
   getDeploymentSnapshot(projectId: string): ManagerTurnInput["deployments"] {
+    const project = this.getProjectById(projectId);
     const recentStableDeployments = this.listDeployments(projectId, "stable", 10);
     const currentStableCommit = recentStableDeployments[0]?.commit;
     const rollbackTarget = recentStableDeployments.find(
@@ -1304,6 +1331,10 @@ export class FactoryDatabase {
         status: (stable?.status as ManagerTurnInput["deployments"]["stable"]["status"]) ?? "degraded",
         url: typeof stable?.url === "string" ? stable.url : "http://127.0.0.1:3000",
         commit: typeof stable?.commit_sha === "string" ? stable.commit_sha : "",
+        branch:
+          typeof stable?.commit_sha === "string" && stable.commit_sha === project.stableCommit
+            ? project.defaultBranch
+            : undefined,
         activeSlot:
           (stable?.active_slot as ManagerTurnInput["deployments"]["stable"]["activeSlot"]) ??
           "stable-a",
@@ -1316,6 +1347,10 @@ export class FactoryDatabase {
         status: (preview?.status as ManagerTurnInput["deployments"]["preview"]["status"]) ?? "down",
         url: typeof preview?.url === "string" ? preview.url : "http://127.0.0.1:3100",
         commit: typeof preview?.commit_sha === "string" ? preview.commit_sha : "",
+        branch:
+          typeof preview?.commit_sha === "string" && preview.commit_sha === project.candidateCommit
+            ? project.candidateBranch
+            : undefined,
         reason: typeof preview?.reason === "string" ? preview.reason : undefined,
         updatedAt: typeof preview?.created_at === "string" ? preview.created_at : undefined
       }

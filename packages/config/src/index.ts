@@ -186,8 +186,8 @@ export function buildFactoryConfig(
       tickSeconds: 15,
       minWorkers: 1,
       maxWorkers: 3,
-      workerStallSeconds: 600,
-      managerStallSeconds: 600,
+      workerStallSeconds: 3600,
+      managerStallSeconds: 3600,
       messageResponseSlaSeconds: 60
     },
     ports: {

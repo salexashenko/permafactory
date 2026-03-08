@@ -436,3 +436,54 @@ test("getManagerInput surfaces reply threading metadata for Telegram messages", 
     assert.equal(input.inboxItems[0]?.externalId, "101");
   });
 });
+
+test("deployment snapshots expose branch identity and latest task events are queryable", async () => {
+  await withDb((db, config) => {
+    const contract = makeTask("task_branchy", []);
+    db.upsertTask({
+      projectId: config.projectId,
+      id: contract.id,
+      kind: "code",
+      status: "done",
+      title: contract.title,
+      priority: "medium",
+      goal: contract.goal,
+      branchName: contract.branchName,
+      baseBranch: contract.baseBranch,
+      worktreePath: contract.worktreePath,
+      contract,
+      blockedByDecisionIds: []
+    });
+    db.updateProjectCommits(config.projectId, "stable_sha", "candidate_sha");
+    db.insertTaskEvent("task_branchy", "completed", "Completed branchy task", {
+      status: "completed",
+      checks: [{ name: "build", status: "passed" }]
+    });
+    db.recordDeployment({
+      projectId: config.projectId,
+      target: "stable",
+      status: "healthy",
+      url: "http://127.0.0.1:3000",
+      commit: "stable_sha",
+      activeSlot: "stable-b",
+      reason: "Stable runtime healthy"
+    });
+    db.recordDeployment({
+      projectId: config.projectId,
+      target: "preview",
+      status: "healthy",
+      url: "http://127.0.0.1:3100",
+      commit: "candidate_sha",
+      reason: "Preview runtime healthy"
+    });
+
+    const latestTaskEvent = db.getLatestTaskEvent("task_branchy");
+    const deployments = db.getDeploymentSnapshot(config.projectId);
+
+    assert.equal(latestTaskEvent?.type, "completed");
+    assert.equal(latestTaskEvent?.payload?.status, "completed");
+    assert.equal(deployments.stable.branch, "main");
+    assert.equal(deployments.preview.branch, "candidate");
+    assert.equal(deployments.stable.activeSlot, "stable-b");
+  });
+});
