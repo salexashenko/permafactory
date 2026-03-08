@@ -13,6 +13,7 @@ import {
   formatHttpUrl,
   isLikelyGreenfieldRepoFiles,
   loadEnvFile,
+  matchesTelegramSlashCommand,
   normalizeManagerTurnOutput,
   parseTopLevelBacklogItems,
   readEnvFileValues,
@@ -248,6 +249,13 @@ test("shouldDeliverTelegramNotification only allows direct replies, decisions, s
     true
   );
   assert.equal(shouldDeliverTelegramNotification("incident_alert"), false);
+});
+
+test("matchesTelegramSlashCommand accepts bot-targeted commands with optional payload", () => {
+  assert.equal(matchesTelegramSlashCommand("/stop", "stop"), true);
+  assert.equal(matchesTelegramSlashCommand("/stop@test_bot", "stop"), true);
+  assert.equal(matchesTelegramSlashCommand("/secret OPENAI_API_KEY sk-test", "secret"), true);
+  assert.equal(matchesTelegramSlashCommand("/hello", "stop"), false);
 });
 
 test("resolveRuntimeScriptCommand prefers the deployed worktree command when available", () => {

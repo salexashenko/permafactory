@@ -263,6 +263,11 @@ export async function upsertEnvFileValue(
   await writeText(filePath, `${nextLines.join("\n")}\n`);
 }
 
+export function matchesTelegramSlashCommand(text: string, command: string): boolean {
+  const trimmed = text.trim();
+  return new RegExp(`^/${command}(?:@\\w+)?(?:\\s+.*)?$`, "i").test(trimmed);
+}
+
 export async function runCommand(
   command: string,
   args: string[],

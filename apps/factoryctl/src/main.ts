@@ -63,6 +63,11 @@ async function main(): Promise<void> {
         [maybeSubcommand, ...rest].filter((value): value is string => typeof value === "string")
       );
       return;
+    case "stop":
+      await handleStop(
+        [maybeSubcommand, ...rest].filter((value): value is string => typeof value === "string")
+      );
+      return;
     case "telegram":
       if (maybeSubcommand !== "connect") {
         usage();
@@ -83,6 +88,7 @@ function usage(): void {
   telegram connect --repo <path> --bot-token-env <ENV_NAME> [--webhook-url <url>] [--timeout-seconds <n>]
   cleanup --repo <path> [--dry-run] [--force]
   start --repo <path> [--foreground] [--once]
+  stop --repo <path> [--force]
 `);
 }
 
@@ -137,6 +143,7 @@ function renderTelegramSetupGuide(config: FactoryProjectConfig): string {
     "10. You do not need to discover the chat id manually; the CLI captures it from /hello.",
     "11. After the chat is bound, add normal API keys from your phone with /secret KEY value.",
     "12. Use /secrets to list configured key names. Multiline secrets should still go in .env.factory from the host shell.",
+    "13. Use /stop in Telegram to shut the factory down cleanly when you want it paused.",
     `More detail: ${path.join(config.repoRoot, config.bootstrap.onboardingSummaryPath)}`
   ].join("\n");
 }
@@ -550,4 +557,181 @@ async function handleStart(args: string[]): Promise<void> {
     detached: true
   });
   console.log(`Started factoryd (pid ${spawned.pid ?? "unknown"})`);
+}
+
+async function handleStop(args: string[]): Promise<void> {
+  const parsed = parseArgs({
+    args,
+    options: {
+      repo: { type: "string" },
+      force: { type: "boolean" }
+    },
+    strict: true
+  });
+
+  const repoRoot = path.resolve(requireString(parsed.values.repo, "--repo"));
+  await loadRepoEnv(repoRoot);
+  const config = await loadProjectConfig(repoRoot);
+  const paths = getFactoryPaths(repoRoot);
+  const supervisorPidText = await readText(paths.supervisorPidPath).catch(() => "");
+  const supervisorPid = Number.parseInt(supervisorPidText.trim(), 10);
+  const knownPorts = [
+    config.ports.stableProxy,
+    config.ports.stableA,
+    config.ports.stableB,
+    config.ports.preview,
+    config.ports.dashboard,
+    config.ports.appServer
+  ];
+
+  let attemptedGracefulStop = false;
+  try {
+    attemptedGracefulStop = await requestDashboardStop(config);
+  } catch {
+    attemptedGracefulStop = false;
+  }
+
+  if (Number.isFinite(supervisorPid)) {
+    if (!attemptedGracefulStop) {
+      await signalProcess(supervisorPid, "SIGTERM");
+    }
+    await waitForProcessExit(supervisorPid, 20_000);
+  }
+
+  const remainingListenerPids = await listListenerPids(repoRoot, knownPorts);
+  const shouldForceCleanup =
+    parsed.values.force ||
+    (Number.isFinite(supervisorPid) && isProcessAlive(supervisorPid)) ||
+    remainingListenerPids.size > 0;
+
+  if (shouldForceCleanup) {
+    if (Number.isFinite(supervisorPid) && isProcessAlive(supervisorPid)) {
+      await killProcessTree(repoRoot, supervisorPid);
+    }
+    for (const pid of remainingListenerPids) {
+      await killProcessTree(repoRoot, pid);
+    }
+  }
+
+  await removePath(paths.supervisorPidPath).catch(() => undefined);
+
+  const listenersAfterStop = await listListenerPids(repoRoot, knownPorts);
+  const stopped =
+    (!Number.isFinite(supervisorPid) || !isProcessAlive(supervisorPid)) &&
+    listenersAfterStop.size === 0;
+
+  if (!stopped) {
+    throw new Error(`Failed to stop factory cleanly for ${repoRoot}`);
+  }
+
+  console.log(`Stopped factoryd for ${repoRoot}`);
+}
+
+async function requestDashboardStop(config: FactoryProjectConfig): Promise<boolean> {
+  const response = await fetch(`http://127.0.0.1:${config.ports.dashboard}/internal/stop`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      reason: "factoryctl_stop"
+    })
+  }).catch(() => undefined);
+
+  return Boolean(response?.ok);
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function signalProcess(pid: number, signal: NodeJS.Signals): Promise<void> {
+  try {
+    process.kill(pid, signal);
+  } catch {
+    // Ignore already-dead processes during stop.
+  }
+}
+
+async function waitForProcessExit(pid: number, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}
+
+async function killProcessTree(repoRoot: string, pid: number): Promise<void> {
+  const psResult = await runCommand(
+    "ps",
+    ["-eo", "pid=,ppid="],
+    {
+      cwd: repoRoot,
+      allowNonZeroExit: true
+    }
+  );
+  const childrenByParent = new Map<number, number[]>();
+  for (const line of psResult.stdout.split(/\r?\n/)) {
+    const match = line.trim().match(/^(\d+)\s+(\d+)$/);
+    if (!match) {
+      continue;
+    }
+    const childPid = Number.parseInt(match[1] ?? "", 10);
+    const parentPid = Number.parseInt(match[2] ?? "", 10);
+    const children = childrenByParent.get(parentPid) ?? [];
+    children.push(childPid);
+    childrenByParent.set(parentPid, children);
+  }
+
+  const descendants = new Set<number>([pid]);
+  const queue = [pid];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (current === undefined) {
+      continue;
+    }
+    for (const childPid of childrenByParent.get(current) ?? []) {
+      if (descendants.has(childPid)) {
+        continue;
+      }
+      descendants.add(childPid);
+      queue.push(childPid);
+    }
+  }
+
+  const ordered = [...descendants].sort((left, right) => right - left);
+  for (const targetPid of ordered) {
+    await signalProcess(targetPid, "SIGTERM");
+  }
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  for (const targetPid of ordered) {
+    if (!isProcessAlive(targetPid)) {
+      continue;
+    }
+    await signalProcess(targetPid, "SIGKILL");
+  }
+}
+
+async function listListenerPids(repoRoot: string, ports: number[]): Promise<Set<number>> {
+  const pids = new Set<number>();
+  for (const port of ports) {
+    const result = await runCommand("ss", ["-ltnp", `( sport = :${port} )`], {
+      cwd: repoRoot,
+      allowNonZeroExit: true
+    }).catch(() => ({ stdout: "", stderr: "", exitCode: 1 }));
+    for (const match of result.stdout.matchAll(/pid=(\d+)/g)) {
+      const pid = Number.parseInt(match[1] ?? "", 10);
+      if (Number.isFinite(pid)) {
+        pids.add(pid);
+      }
+    }
+  }
+  return pids;
 }

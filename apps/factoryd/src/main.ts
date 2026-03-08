@@ -66,6 +66,7 @@ import {
   slugify,
   spawnLoggedShellCommand,
   spawnLoggedProcess,
+  matchesTelegramSlashCommand,
   updateGitBranchRef,
   upsertEnvFileValue,
   validateWithSchema,
@@ -201,7 +202,17 @@ async function main(): Promise<void> {
   db.init();
   db.upsertProject(config);
   const supervisor = new FactorySupervisor(config, db);
-  await supervisor.run(Boolean(parsed.values.once));
+  const handleStopSignal = () => {
+    void supervisor.requestShutdown("signal");
+  };
+  process.once("SIGTERM", handleStopSignal);
+  process.once("SIGINT", handleStopSignal);
+  try {
+    await supervisor.run(Boolean(parsed.values.once));
+  } finally {
+    process.off("SIGTERM", handleStopSignal);
+    process.off("SIGINT", handleStopSignal);
+  }
 }
 
 class AppServerClient {
@@ -463,6 +474,8 @@ class FactorySupervisor {
   private managerToolToken = "";
   private managerThreadNeedsRotation = false;
   private stopRequested = false;
+  private shuttingDown = false;
+  private shutdownPromise?: Promise<void>;
   private telegramPollingTask?: Promise<void>;
   private workerSandboxCapabilities?: WorkerSandboxCapabilities & { sandboxMode: string };
 
@@ -481,6 +494,7 @@ class FactorySupervisor {
 
   async run(once: boolean): Promise<void> {
     this.stopRequested = false;
+    this.shuttingDown = false;
     await ensureDir(this.paths.logsDir);
     await ensureDir(this.paths.tasksDir);
     await ensureDir(this.paths.worktreesDir);
@@ -498,15 +512,22 @@ class FactorySupervisor {
 
       do {
         await this.tick();
-        if (!once) {
-          await new Promise((resolve) => setTimeout(resolve, this.config.scheduler.tickSeconds * 1000));
+        if (!once && !this.stopRequested) {
+          await this.waitForNextTickOrStop();
         }
-      } while (!once);
+      } while (!once && !this.stopRequested);
     } finally {
-      this.stopRequested = true;
+      await this.requestShutdown("run_finally").catch(() => undefined);
       await this.telegramPollingTask?.catch(() => undefined);
       await this.releaseSupervisorPid();
     }
+  }
+
+  async requestShutdown(reason: string): Promise<void> {
+    if (!this.shutdownPromise) {
+      this.shutdownPromise = this.performShutdown(reason);
+    }
+    await this.shutdownPromise;
   }
 
   private async claimSupervisorPid(): Promise<void> {
@@ -527,6 +548,107 @@ class FactorySupervisor {
     }
   }
 
+  private async performShutdown(reason: string): Promise<void> {
+    if (this.shuttingDown) {
+      return;
+    }
+
+    this.shuttingDown = true;
+    this.stopRequested = true;
+    this.pendingManagerWakeReasons.clear();
+
+    await this.interruptManagerIfRunning().catch(() => undefined);
+
+    const agents = this.db.listAgents(this.config.projectId);
+    for (const agent of agents) {
+      if (agent.role === "manager") {
+        if (agent.status === "running") {
+          this.db.upsertAgent({
+            id: agent.id,
+            projectId: agent.projectId,
+            role: agent.role,
+            status: "idle",
+            threadId: agent.threadId,
+            metadata: {
+              ...agent.metadata,
+              stoppedAt: nowIso(),
+              stopReason: reason
+            }
+          });
+        }
+        continue;
+      }
+
+      if (agent.status !== "running" || !agent.taskId) {
+        continue;
+      }
+
+      const task = this.db.getTask(agent.taskId);
+      if (!task) {
+        continue;
+      }
+
+      const nextTaskStatus = agent.role === "review" ? "review" : "queued";
+      this.db.updateTaskStatus(task.id, nextTaskStatus);
+      this.db.insertTaskEvent(
+        task.id,
+        nextTaskStatus,
+        agent.role === "review"
+          ? `Review interrupted by factory shutdown (${reason}); decide the next step after restart`
+          : `Task stopped by factory shutdown (${reason}) and re-queued for the next start`
+      );
+      this.db.upsertAgent({
+        id: agent.id,
+        projectId: agent.projectId,
+        role: agent.role,
+        status: "failed",
+        taskId: agent.taskId,
+        branch: agent.branch,
+        worktreePath: agent.worktreePath,
+        threadId: agent.threadId,
+        turnId: agent.turnId,
+        metadata: {
+          ...agent.metadata,
+          stoppedAt: nowIso(),
+          stopReason: reason
+        }
+      });
+    }
+
+    for (const child of this.workerChildren.values()) {
+      if (child.pid) {
+        await this.terminateProcessTree(child.pid);
+      }
+    }
+    this.workerChildren.clear();
+
+    for (const slot of ["stable-a", "stable-b", "preview"] as RuntimeSlotName[]) {
+      await this.stopRuntimeProcess(slot);
+    }
+    for (const port of [
+      this.config.ports.stableA,
+      this.config.ports.stableB,
+      this.config.ports.preview
+    ]) {
+      await this.stopOrphanRuntimeListeners(port);
+    }
+
+    if (this.stableProxyServer) {
+      await new Promise<void>((resolve) => this.stableProxyServer?.close(() => resolve()));
+      this.stableProxyServer = undefined;
+    }
+
+    if (this.dashboardServer) {
+      await new Promise<void>((resolve) => this.dashboardServer?.close(() => resolve()));
+      this.dashboardServer = undefined;
+    }
+
+    await this.resetManagerTransport().catch(() => undefined);
+    this.activeManagerTurnId = undefined;
+    this.activeManagerThreadId = undefined;
+    this.managerRunning = false;
+  }
+
   private async ensureManagerToolToken(): Promise<void> {
     const existing = await readText(this.paths.managerToolTokenPath).catch(() => "");
     const trimmed = existing.trim();
@@ -541,6 +663,9 @@ class FactorySupervisor {
   }
 
   private async tick(): Promise<void> {
+    if (this.stopRequested) {
+      return;
+    }
     this.config = await loadProjectConfig(this.config.repoRoot);
     this.db.upsertProject(this.config);
     await this.refreshProjectState();
@@ -561,6 +686,9 @@ class FactorySupervisor {
       this.pendingManagerWakeReasons.add("decision_timeout");
     }
 
+    if (this.stopRequested) {
+      return;
+    }
     const resources = await this.sampleManagerResources();
     this.db.recordHealthSample(this.config.projectId, resources);
     await this.maybeSendDailyDigest(resources);
@@ -570,7 +698,17 @@ class FactorySupervisor {
       await this.runManagerTurn(resources);
     }
 
+    if (this.stopRequested) {
+      return;
+    }
     await this.startQueuedTasksIfPossible();
+  }
+
+  private async waitForNextTickOrStop(): Promise<void> {
+    const deadline = Date.now() + this.config.scheduler.tickSeconds * 1000;
+    while (!this.stopRequested && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
   }
 
   private shouldRunManager(_resources: ManagerTurnInput["resources"]): boolean {
@@ -686,6 +824,10 @@ class FactorySupervisor {
       const validated = await validateWithSchema<ManagerTurnOutput>(this.managerSchemaPath, normalized);
       if (!validated.valid) {
         throw new Error(`Manager output validation failed: ${validated.errors.join("; ")}`);
+      }
+
+      if (this.stopRequested) {
+        return;
       }
 
       await this.applyManagerOutput(validated.value, wakeReasons, input.userMessages.length > 0);
@@ -2497,6 +2639,9 @@ class FactorySupervisor {
   }
 
   private async startQueuedTasksIfPossible(): Promise<void> {
+    if (this.stopRequested) {
+      return;
+    }
     const runningWorkers = this.db
       .listAgents(this.config.projectId)
       .filter((agent) => agent.role !== "manager" && agent.status === "running").length;
@@ -2695,6 +2840,10 @@ class FactorySupervisor {
 
     child.on("exit", async () => {
       try {
+        if (this.shuttingDown) {
+          this.db.finishRun(runId, "failed");
+          return;
+        }
         await this.handleWorkerExit(normalized, role, runId, {
           finalMessagePath,
           jsonlLogPath
@@ -3891,6 +4040,32 @@ class FactorySupervisor {
           return;
         }
 
+        if (request.method === "POST" && url.pathname === "/internal/stop") {
+          const authorization = request.headers.authorization;
+          const remoteAddress = request.socket.remoteAddress;
+          const isLoopback =
+            remoteAddress === "127.0.0.1" ||
+            remoteAddress === "::1" ||
+            remoteAddress === "::ffff:127.0.0.1";
+          if (!isLoopback && authorization !== `Bearer ${this.managerToolToken}`) {
+            response.writeHead(403, { "content-type": "application/json" });
+            response.end(JSON.stringify({ ok: false, error: "forbidden" }));
+            return;
+          }
+
+          const body = (await this.readJsonRequestBody(request).catch(() => ({}))) as Record<string, unknown>;
+          const reason =
+            typeof body.reason === "string" && body.reason.trim().length > 0
+              ? body.reason.trim()
+              : "internal_stop";
+          response.writeHead(202, { "content-type": "application/json" });
+          response.end(JSON.stringify({ ok: true, stopping: true, reason }));
+          setImmediate(() => {
+            void this.requestShutdown(reason);
+          });
+          return;
+        }
+
         response.writeHead(404, { "content-type": "application/json" });
         response.end(JSON.stringify({ error: "not_found" }));
       } catch (error) {
@@ -4005,6 +4180,15 @@ class FactorySupervisor {
         message.chat?.type
       )
     ) {
+      if (matchesTelegramSlashCommand(message.text, "stop")) {
+        await this.handleStopCommand(
+          message.text,
+          message.message_id ? String(message.message_id) : undefined,
+          message.chat?.id ? String(message.chat.id) : undefined
+        );
+        return;
+      }
+
       const secretCommand = this.parseSecretCommand(message.text);
       if (secretCommand) {
         await this.handleSecretCommand(secretCommand, message.message_id ? String(message.message_id) : undefined);
@@ -4216,6 +4400,31 @@ class FactorySupervisor {
     );
     await this.interruptManagerIfRunning();
     this.pendingManagerWakeReasons.add("secret_updated");
+  }
+
+  private async handleStopCommand(
+    originalText: string,
+    replyToMessageId?: string,
+    chatId?: string
+  ): Promise<void> {
+    this.db.insertTelegramMessage({
+      id: randomId("telegram"),
+      projectId: this.config.projectId,
+      telegramMessageId: replyToMessageId,
+      chatId,
+      direction: "inbound",
+      kind: "command",
+      text: originalText
+    });
+    await this.sendTelegramMessage(
+      "info_update",
+      "Stopping the factory now. Active workers, preview, and stable runtimes are being shut down cleanly.",
+      replyToMessageId,
+      undefined,
+      undefined,
+      { isDirectUserResponse: true }
+    );
+    await this.requestShutdown("telegram_stop");
   }
 
   private isTelegramActorAllowed(
