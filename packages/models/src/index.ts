@@ -144,6 +144,7 @@ export interface ManagerTurnInput {
     id: string;
     bootstrapStatus: BootstrapStatus;
     projectSpecPath?: string;
+    projectSpecExcerpt?: string;
     onboardingSummaryPath: string;
     availableSecretKeys: string[];
   };
@@ -352,6 +353,7 @@ export interface TaskContract {
   id: string;
   kind: TaskKind;
   title: string;
+  commitMessageHint?: string;
   goal: string;
   acceptanceCriteria: string[];
   baseBranch: string;
@@ -376,6 +378,8 @@ export interface TaskContract {
     userIntent: string;
     relatedTaskIds: string[];
     blockingDecisions: string[];
+    projectSpecPath?: string;
+    projectSpecExcerpt?: string;
     runtimeCapabilities?: WorkerSandboxCapabilities;
   };
 }

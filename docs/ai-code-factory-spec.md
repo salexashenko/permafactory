@@ -300,7 +300,8 @@ factoryctl init \
   --repo /srv/projects/acme-web \
   --project-id acme-web \
   --default-branch main \
-  --project-spec-path docs/project-spec.md
+  --project-spec-path docs/project-spec.md \
+  --sandbox-mode danger-full-access
 ```
 
 `factoryctl init` must:
@@ -312,6 +313,7 @@ factoryctl init \
 - create `.factory/runs/` and `.factory/scripts/`
 - create `candidate` from the default branch if it does not exist
 - generate `factory.config.ts` with discovered defaults and placeholders
+- default worker sandboxing to `danger-full-access`, while allowing an explicit `--sandbox-mode workspace-write` override
 - detect a likely repo-local project spec path, or accept an explicit `--project-spec-path`
 - if no project spec exists, scaffold one at `docs/project-spec.md`
 - generate a `.env.factory.example`

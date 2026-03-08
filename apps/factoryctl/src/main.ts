@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import process from "node:process";
 import { FactoryDatabase } from "@permafactory/db";
-import type { FactoryProjectConfig, InboxItem, TaskPriority } from "@permafactory/models";
+import type { FactoryProjectConfig, InboxItem, SandboxMode, TaskPriority } from "@permafactory/models";
 import { ensureProjectSpecAndConfig, getConfigPath, loadProjectConfig, renderFactoryConfig } from "@permafactory/config";
 import {
   branchExists,
@@ -77,13 +77,27 @@ async function main(): Promise<void> {
 
 function usage(): void {
   console.log(`factoryctl commands:
-  init --repo <path> --project-id <id> --default-branch <branch> [--project-spec-path <path>]
+  init --repo <path> --project-id <id> --default-branch <branch> [--project-spec-path <path>] [--sandbox-mode <danger-full-access|workspace-write>]
   status --repo <path> [--json] [--assert-healthy]
   ingest backlog --repo <path> [--file <path>] [--text <text>]
   telegram connect --repo <path> --bot-token-env <ENV_NAME> [--webhook-url <url>] [--timeout-seconds <n>]
   cleanup --repo <path> [--dry-run] [--force]
   start --repo <path> [--foreground] [--once]
 `);
+}
+
+function parseSandboxMode(value: string | undefined): SandboxMode | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === "danger-full-access" || value === "workspace-write") {
+    return value;
+  }
+  throw new Error(`Invalid --sandbox-mode: ${value}`);
+}
+
+function describeWorkerNetworkAccess(config: FactoryProjectConfig): string {
+  return config.codex.sandboxMode === "workspace-write" ? "restricted" : "available";
 }
 
 function requireString(value: string | undefined, name: string): string {
@@ -110,6 +124,7 @@ function renderTelegramSetupGuide(config: FactoryProjectConfig): string {
   return [
     "",
     "Telegram setup",
+    `Worker network access: ${describeWorkerNetworkAccess(config)}`,
     `1. Open Telegram and start a chat with @BotFather.`,
     "2. Send /newbot and follow the prompts for the bot name and username.",
     `3. Put the token into ${path.join(config.repoRoot, ".env.factory")} as ${config.telegram.botTokenEnvVar}=...`,
@@ -133,7 +148,8 @@ async function handleInit(args: string[]): Promise<void> {
       repo: { type: "string" },
       "project-id": { type: "string" },
       "default-branch": { type: "string" },
-      "project-spec-path": { type: "string" }
+      "project-spec-path": { type: "string" },
+      "sandbox-mode": { type: "string" }
     },
     strict: true
   });
@@ -142,6 +158,7 @@ async function handleInit(args: string[]): Promise<void> {
   const projectId = requireString(parsed.values["project-id"], "--project-id");
   let defaultBranch = requireString(parsed.values["default-branch"], "--default-branch");
   const projectSpecPath = parsed.values["project-spec-path"];
+  const sandboxMode = parseSandboxMode(parsed.values["sandbox-mode"]);
 
   await withProjectLock(repoRoot, async () => {
     await loadRepoEnv(repoRoot);
@@ -169,7 +186,8 @@ async function handleInit(args: string[]): Promise<void> {
       repoRoot,
       projectId,
       defaultBranch,
-      projectSpecPath
+      projectSpecPath,
+      sandboxMode
     });
 
     await ensureBranchFrom(repoRoot, config.candidateBranch, config.defaultBranch);
@@ -189,6 +207,7 @@ async function handleInit(args: string[]): Promise<void> {
     console.log(`config: ${getConfigPath(repoRoot)}`);
     console.log(`candidate branch: ${config.candidateBranch}`);
     console.log(`project spec: ${config.projectSpecPath}`);
+    console.log(`worker network access: ${describeWorkerNetworkAccess(config)}`);
     console.log(`env template: ${path.join(repoRoot, ".env.factory.example")}`);
     console.log(renderTelegramSetupGuide(config));
   });

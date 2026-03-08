@@ -2,11 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import {
   allocatePorts,
   applyWorkerSandboxCapabilities,
+  buildProjectSpecExcerpt,
   computeDecisionBudgetSnapshot,
+  currentCommit,
   deriveEffectivePortLeaseRequirement,
   formatHttpUrl,
   isLikelyGreenfieldRepoFiles,
@@ -15,8 +17,11 @@ import {
   parseTopLevelBacklogItems,
   readEnvFileValues,
   resolveRuntimeScriptCommand,
+  runCommand,
   selectReachableHost,
+  selectTaskCommitMessage,
   shouldDeliverTelegramNotification,
+  updateGitBranchRef,
   upsertEnvFileValue,
   validateWithSchema
 } from "@permafactory/runtime";
@@ -224,6 +229,15 @@ test("formatHttpUrl brackets IPv6 hosts", () => {
   assert.equal(formatHttpUrl("fd7a:115c:a1e0::ea01:583a", 3100), "http://[fd7a:115c:a1e0::ea01:583a]:3100");
 });
 
+test("buildProjectSpecExcerpt preserves short specs and truncates long ones", () => {
+  assert.equal(buildProjectSpecExcerpt("## Spec\nShip it\n", { maxChars: 100 }), "## Spec\nShip it");
+
+  const longText = "A".repeat(120);
+  const excerpt = buildProjectSpecExcerpt(longText, { maxChars: 40 });
+  assert.match(excerpt, /^\S{40}/);
+  assert.match(excerpt, /\[project spec excerpt truncated\]$/);
+});
+
 test("shouldDeliverTelegramNotification only allows direct replies, decisions, ships, and digests", () => {
   assert.equal(shouldDeliverTelegramNotification("decision_required"), true);
   assert.equal(shouldDeliverTelegramNotification("ship_result"), true);
@@ -252,6 +266,53 @@ test("resolveRuntimeScriptCommand falls back to configured overrides when detect
     resolveRuntimeScriptCommand("echo 'serve script not configured'", "node scripts/custom-serve.mjs"),
     "node scripts/custom-serve.mjs"
   );
+});
+
+test("selectTaskCommitMessage prefers manager-owned commit summaries", () => {
+  assert.equal(
+    selectTaskCommitMessage({
+      taskId: "task_feature",
+      title: "Implement basic incident investigation flow",
+      commitMessageHint: "Add first incident investigation flow to the Verdant field notebook",
+      recommendedCommitMessage: "test: harden coverage",
+      summary: "Added incident investigation UI and state flow"
+    }),
+    "Add first incident investigation flow to the Verdant field notebook"
+  );
+});
+
+test("selectTaskCommitMessage falls back to the manager task title before worker prefixes", () => {
+  assert.equal(
+    selectTaskCommitMessage({
+      taskId: "task_feature",
+      title: "Add first creature bond interaction",
+      recommendedCommitMessage: "fix: wire button"
+    }),
+    "Add first creature bond interaction"
+  );
+});
+
+test("updateGitBranchRef advances a branch ref to the deployed commit", async () => {
+  const repoRoot = await mkdtemp(path.join(os.tmpdir(), "permafactory-git-"));
+
+  await runCommand("git", ["init", "-b", "main"], { cwd: repoRoot });
+  await runCommand("git", ["config", "user.name", "Permafactory Test"], { cwd: repoRoot });
+  await runCommand("git", ["config", "user.email", "permafactory@example.com"], { cwd: repoRoot });
+
+  await writeFile(path.join(repoRoot, "spec.md"), "# Demo\n");
+  await runCommand("git", ["add", "spec.md"], { cwd: repoRoot });
+  await runCommand("git", ["commit", "-m", "Initial spec"], { cwd: repoRoot });
+  await runCommand("git", ["branch", "candidate"], { cwd: repoRoot });
+  await runCommand("git", ["checkout", "candidate"], { cwd: repoRoot });
+  await writeFile(path.join(repoRoot, "feature.txt"), "hello\n");
+  await runCommand("git", ["add", "feature.txt"], { cwd: repoRoot });
+  await runCommand("git", ["commit", "-m", "Feature commit"], { cwd: repoRoot });
+  const featureCommit = await currentCommit(repoRoot, "HEAD");
+  await runCommand("git", ["checkout", "main"], { cwd: repoRoot });
+
+  await updateGitBranchRef(repoRoot, "main", featureCommit);
+
+  assert.equal(await currentCommit(repoRoot, "main"), featureCommit);
 });
 
 test("manager output schema accepts a minimal valid payload", async () => {

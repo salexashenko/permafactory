@@ -401,6 +401,50 @@ export async function currentCommit(repoRoot: string, ref = "HEAD"): Promise<str
   return result.stdout.trim();
 }
 
+export function buildProjectSpecExcerpt(
+  text: string,
+  options: {
+    maxChars?: number;
+  } = {}
+): string {
+  const maxChars = options.maxChars ?? 18_000;
+  const normalized = text.trim();
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, maxChars)}\n\n[project spec excerpt truncated]`;
+}
+
+function firstMeaningfulLine(value?: string): string | undefined {
+  const line = value?.trim().split(/\r?\n/, 1)[0]?.trim();
+  return line && line.length > 0 ? line : undefined;
+}
+
+export function selectTaskCommitMessage(options: {
+  taskId: string;
+  title: string;
+  commitMessageHint?: string;
+  recommendedCommitMessage?: string;
+  summary?: string;
+}): string {
+  const candidate =
+    firstMeaningfulLine(options.commitMessageHint) ??
+    firstMeaningfulLine(options.title) ??
+    firstMeaningfulLine(options.recommendedCommitMessage) ??
+    firstMeaningfulLine(options.summary) ??
+    `Complete ${options.taskId}`;
+  return candidate.slice(0, 120);
+}
+
+export async function updateGitBranchRef(
+  repoRoot: string,
+  branch: string,
+  commit: string
+): Promise<void> {
+  await runCommand("git", ["update-ref", `refs/heads/${branch}`, commit], { cwd: repoRoot });
+}
+
 export async function listDirtyFiles(repoRoot: string): Promise<string[]> {
   const result = await runCommand("git", ["status", "--short"], { cwd: repoRoot });
   return result.stdout

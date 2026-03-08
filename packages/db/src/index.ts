@@ -1425,6 +1425,7 @@ export class FactoryDatabase {
         id: config.projectId,
         bootstrapStatus: project.bootstrapStatus,
         projectSpecPath: project.projectSpecPath,
+        projectSpecExcerpt: undefined,
         onboardingSummaryPath: project.onboardingSummaryPath,
         availableSecretKeys: []
       },

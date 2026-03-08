@@ -1,6 +1,6 @@
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import type { FactoryProjectConfig } from "@permafactory/models";
+import type { FactoryProjectConfig, SandboxMode } from "@permafactory/models";
 import {
   DEFAULT_CANDIDATE_BRANCH,
   DEFAULT_ONBOARDING_SUMMARY_PATH,
@@ -21,6 +21,7 @@ export interface InitConfigOptions {
   projectId: string;
   defaultBranch: string;
   projectSpecPath?: string;
+  sandboxMode?: SandboxMode;
 }
 
 export interface ScriptDetection {
@@ -157,7 +158,7 @@ export function buildFactoryConfig(
       model: "gpt-5.4",
       managerModel: "gpt-5.4",
       approvalPolicy: "never",
-      sandboxMode: "workspace-write",
+      sandboxMode: options.sandboxMode ?? "danger-full-access",
       appServerUrl: "ws://127.0.0.1:7781",
       searchEnabled: true,
       codingReasoningPolicy: {
@@ -221,8 +222,16 @@ export function renderEnvExample(config: FactoryProjectConfig): string {
   return `# Copy this file to .env.factory for local CLI use.\n# Create the bot token with @BotFather -> /newbot.\n${config.telegram.botTokenEnvVar}=replace-me\n# Generate with: openssl rand -hex 32\n${config.telegram.webhookSecretEnvVar}=replace-me\n# After Telegram is connected, you can add normal API keys from your phone with:\n# /secret OPENAI_API_KEY sk-...\n`;
 }
 
-export function renderAgentsStub(projectId: string): string {
-  return `# ${projectId} Factory Policy\n\n- Keep \`stable\` safe.\n- Prefer small, reviewable changes.\n- Route user-triggerable frontend actions through the shared browser action registry.\n`;
+export function renderAgentsStub(projectId: string, projectSpecPath: string): string {
+  return `# ${projectId} Factory Policy
+
+- Read \`${projectSpecPath}\` at the start of every task, review, and test run.
+- Treat that spec as the canonical product direction unless a newer explicit user instruction overrides it.
+- Prefer the smallest user-visible step that moves the product toward the spec.
+- Keep \`stable\` safe.
+- Prefer small, reviewable changes.
+- Route user-triggerable frontend actions through the shared browser action registry.
+`;
 }
 
 export function renderBootstrapScript(): string {
@@ -252,6 +261,8 @@ const LEGACY_ONBOARDING_PLACEHOLDER =
   "# Factory Onboarding Summary\n\nThis file will be populated by bootstrap runs.\n";
 
 export function renderOnboardingSummary(config: FactoryProjectConfig): string {
+  const workerNetworkAccess =
+    config.codex.sandboxMode === "workspace-write" ? "restricted" : "available";
   return `# Factory Onboarding Summary
 
 ## Immediate Next Step: Telegram Bootstrap
@@ -316,6 +327,8 @@ Notes:
 
 - \`factoryctl telegram connect\` binds the chat, records the first admin user, and can configure the production webhook.
 - Until Telegram is connected, bootstrap status remains \`waiting_for_telegram\`.
+- Worker network access is currently \`${workerNetworkAccess}\`.
+- Dedicated-box defaults are configured to let workers call external APIs without fighting the harness.
 `;
 }
 
@@ -340,7 +353,7 @@ export async function writeBootstrapArtifacts(
   await writeText(paths.configPath, renderFactoryConfig(config));
   await writeText(path.join(config.repoRoot, ".env.factory.example"), envExample);
   await writeTextIfAbsent(path.join(config.repoRoot, ".env.factory"), envExample);
-  await writeTextIfAbsent(path.join(config.repoRoot, "AGENTS.md"), renderAgentsStub(projectId));
+  await writeTextIfAbsent(path.join(config.repoRoot, "AGENTS.md"), renderAgentsStub(projectId, config.projectSpecPath));
   await writeText(paths.bootstrapScriptPath, renderBootstrapScript());
   const onboardingPath = path.join(config.repoRoot, config.bootstrap.onboardingSummaryPath);
   await ensureDir(path.dirname(onboardingPath));

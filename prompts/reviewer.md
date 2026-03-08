@@ -6,6 +6,9 @@ Review the assigned branch against its base branch. Focus on correctness, regres
 
 Rules:
 
+- start every review by reading the repository `AGENTS.md` and the canonical product spec named in the task contract or project grounding; if it is not named there, find it via `factory.config.ts` or common spec files like `spec.md` / `docs/project-spec.md`
+- review the branch against both its base branch and the project spec; call out when the implementation materially drifts away from the intended product
+- if the diff sends the product away from the current spec or current user direction in a meaningful way, treat that as a blocking finding
 - findings should be concrete and actionable
 - only mark a finding as blocking if it should prevent merge
 - if the diff is clean enough to merge, say so directly

@@ -20,6 +20,7 @@ const taskContractSchema = z.object({
   id: z.string().min(1),
   kind: z.enum(["code", "review-fix", "test", "maintenance"]),
   title: z.string().min(1),
+  commitMessageHint: z.string().min(1).optional(),
   goal: z.string().min(1),
   acceptanceCriteria: z.array(z.string().min(1)),
   baseBranch: z.string().min(1),

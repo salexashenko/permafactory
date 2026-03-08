@@ -38,6 +38,7 @@ import {
   addWorktree,
   allocatePorts,
   applyWorkerSandboxCapabilities,
+  buildProjectSpecExcerpt,
   currentCommit,
   deriveEffectivePortLeaseRequirement,
   ensureDetachedWorktreeAtRef,
@@ -51,6 +52,7 @@ import {
   localDateString,
   normalizeManagerTurnOutput,
   nowIso,
+  pollTelegramUpdates,
   randomId,
   readEnvFileValues,
   readText,
@@ -58,11 +60,13 @@ import {
   resolveReachableHttpUrl,
   runCommand,
   sampleResources,
+  selectTaskCommitMessage,
   sendTelegramApiRequest,
   shouldDeliverTelegramNotification,
   slugify,
   spawnLoggedShellCommand,
   spawnLoggedProcess,
+  updateGitBranchRef,
   upsertEnvFileValue,
   validateWithSchema,
   waitForSuccessfulCommand,
@@ -116,6 +120,7 @@ interface ManagedRuntimeProcess {
 
 interface ResolvedRuntimeScripts {
   worktreePath: string;
+  buildScript: string;
   serveScript: string;
   healthcheckScript: string;
 }
@@ -405,6 +410,8 @@ class FactorySupervisor {
   private activeManagerReplyToMessageId?: string;
   private managerToolToken = "";
   private managerThreadNeedsRotation = false;
+  private stopRequested = false;
+  private telegramPollingTask?: Promise<void>;
   private workerSandboxCapabilities?: WorkerSandboxCapabilities & { sandboxMode: string };
 
   constructor(private config: FactoryProjectConfig, private readonly db: FactoryDatabase) {
@@ -421,6 +428,7 @@ class FactorySupervisor {
   }
 
   async run(once: boolean): Promise<void> {
+    this.stopRequested = false;
     await ensureDir(this.paths.logsDir);
     await ensureDir(this.paths.tasksDir);
     await ensureDir(this.paths.worktreesDir);
@@ -432,6 +440,9 @@ class FactorySupervisor {
     try {
       await this.refreshProjectState();
       await this.startDashboardServer();
+      if (!once) {
+        await this.startTelegramPollingFallback();
+      }
 
       do {
         await this.tick();
@@ -440,6 +451,8 @@ class FactorySupervisor {
         }
       } while (!once);
     } finally {
+      this.stopRequested = true;
+      await this.telegramPollingTask?.catch(() => undefined);
       await this.releaseSupervisorPid();
     }
   }
@@ -761,6 +774,7 @@ class FactorySupervisor {
   private async buildManagerInput(resources: ManagerTurnInput["resources"]): Promise<ManagerTurnInput> {
     const input = this.db.getManagerInput(this.config);
     input.project.availableSecretKeys = await this.listAvailableSecretKeys();
+    input.project.projectSpecExcerpt = await this.loadProjectSpecExcerpt();
     input.repo.dirtyFiles = await listDirtyFiles(this.config.repoRoot);
     input.repo.currentStableCommit = await currentCommit(this.config.repoRoot, this.config.defaultBranch);
     input.repo.currentCandidateCommit = await currentCommit(
@@ -776,6 +790,20 @@ class FactorySupervisor {
     input.resources = resources;
     input.deployments = this.db.getDeploymentSnapshot(this.config.projectId);
     return input;
+  }
+
+  private async loadProjectSpecExcerpt(): Promise<string | undefined> {
+    if (!this.config.projectSpecPath) {
+      return undefined;
+    }
+
+    const resolvedPath = path.resolve(this.config.repoRoot, this.config.projectSpecPath);
+    const text = await readText(resolvedPath).catch(() => undefined);
+    if (!text) {
+      return undefined;
+    }
+
+    return buildProjectSpecExcerpt(text);
   }
 
   private async sampleManagerResources(): Promise<ManagerTurnInput["resources"]> {
@@ -1678,7 +1706,7 @@ class FactorySupervisor {
   }
 
   private async commitTaskWorktree(
-    contract: Pick<TaskContract, "id" | "title" | "branchName" | "worktreePath">,
+    contract: Pick<TaskContract, "id" | "title" | "commitMessageHint" | "branchName" | "worktreePath">,
     recommendedCommitMessage?: string,
     summary?: string
   ): Promise<string | undefined> {
@@ -1700,11 +1728,13 @@ class FactorySupervisor {
       return undefined;
     }
 
-    const firstLine =
-      recommendedCommitMessage?.trim().split(/\r?\n/, 1)[0] ??
-      summary?.trim().split(/\r?\n/, 1)[0] ??
-      `Complete ${contract.title}`;
-    const commitMessage = firstLine.slice(0, 120) || `Complete ${contract.id}`;
+    const commitMessage = selectTaskCommitMessage({
+      taskId: contract.id,
+      title: contract.title,
+      commitMessageHint: contract.commitMessageHint,
+      recommendedCommitMessage,
+      summary
+    });
     const commit = await runCommand("git", ["commit", "-m", commitMessage, "--no-verify"], {
       cwd: contract.worktreePath,
       allowNonZeroExit: true
@@ -1813,6 +1843,7 @@ class FactorySupervisor {
     role: "code" | "review" | "test"
   ): Promise<void> {
     const workerSandboxCapabilities = await this.ensureWorkerSandboxCapabilities();
+    const projectSpecExcerpt = await this.loadProjectSpecExcerpt();
     const worktreeId = contract.id;
     const worktreePath = contract.worktreePath;
     const branchName = contract.branchName;
@@ -1832,6 +1863,11 @@ class FactorySupervisor {
     const portAwareContract = applyWorkerSandboxCapabilities(contract, workerSandboxCapabilities);
     const normalized: TaskContract = {
       ...portAwareContract,
+      context: {
+        ...portAwareContract.context,
+        projectSpecPath: portAwareContract.context.projectSpecPath ?? this.config.projectSpecPath,
+        projectSpecExcerpt: portAwareContract.context.projectSpecExcerpt ?? projectSpecExcerpt
+      },
       ports: {
         ...(portAwareContract.ports.app !== undefined ? { app: portAwareContract.ports.app } : {}),
         ...(portAwareContract.ports.e2e !== undefined ? { e2e: portAwareContract.ports.e2e } : {}),
@@ -2296,16 +2332,16 @@ class FactorySupervisor {
       throw new Error("Stable serve script is not configured");
     }
     const stableUrl = await this.resolveStableUrl();
-    this.db.recordDeployment({
-      projectId: this.config.projectId,
-      target: "stable",
-      status: ensured.ok ? "healthy" : "down",
-      url: stableUrl,
-      commit,
-      activeSlot: nextSlot,
-      reason
-    });
     if (!ensured.ok) {
+      this.db.recordDeployment({
+        projectId: this.config.projectId,
+        target: "stable",
+        status: "down",
+        url: stableUrl,
+        commit,
+        activeSlot: nextSlot,
+        reason
+      });
       await this.sendTelegramMessage(
         "incident_alert",
         `Stable promotion failed for ${commit.slice(0, 12)}.\nExpected URL: ${stableUrl}\n${reason}`
@@ -2313,6 +2349,24 @@ class FactorySupervisor {
       return;
     }
 
+    const currentDefaultHead = await currentCommit(this.config.repoRoot, this.config.defaultBranch);
+    const mergeBase = await runCommand("git", ["merge-base", this.config.defaultBranch, commit], {
+      cwd: this.config.repoRoot
+    });
+    if (mergeBase.stdout.trim() !== currentDefaultHead) {
+      throw new Error(`Cannot fast-forward ${this.config.defaultBranch} to ${commit.slice(0, 12)}`);
+    }
+    await updateGitBranchRef(this.config.repoRoot, this.config.defaultBranch, commit);
+    await this.refreshProjectState();
+    this.db.recordDeployment({
+      projectId: this.config.projectId,
+      target: "stable",
+      status: "healthy",
+      url: stableUrl,
+      commit,
+      activeSlot: nextSlot,
+      reason
+    });
     await this.ensureStableProxyServer();
     const tag = `stable-${new Date().toISOString().replace(/[:.]/g, "-")}`;
     this.db.insertReleaseTag(this.config.projectId, tag, commit);
@@ -2334,6 +2388,10 @@ class FactorySupervisor {
       throw new Error("Stable serve script is not configured");
     }
     const stableUrl = await this.resolveStableUrl();
+    if (ensured.ok) {
+      await updateGitBranchRef(this.config.repoRoot, this.config.defaultBranch, commit);
+      await this.refreshProjectState();
+    }
     this.db.recordDeployment({
       projectId: this.config.projectId,
       target: "stable",
@@ -2408,6 +2466,7 @@ class FactorySupervisor {
     }
 
     await this.stopRuntimeProcess(slot);
+    await this.stopOrphanRuntimeListeners(port);
     const scripts = await this.prepareRuntimeWorktree(slot, commit, port);
     if (isPlaceholderScript(scripts.serveScript)) {
       return {
@@ -2533,6 +2592,7 @@ class FactorySupervisor {
     );
     return {
       worktreePath,
+      buildScript: resolveRuntimeScriptCommand(detected.scripts.build, this.config.scripts.build),
       serveScript: resolveRuntimeScriptCommand(
         detectedServeScript,
         configuredServeScript
@@ -2552,16 +2612,21 @@ class FactorySupervisor {
     const worktreePath = this.runtimeSlotWorktreePath(slot);
     await ensureDir(path.dirname(worktreePath));
     await ensureDetachedWorktreeAtRef(this.config.repoRoot, worktreePath, commit);
-    await runCommand(
-      "bash",
-      [path.resolve(this.config.repoRoot, this.config.scripts.bootstrapWorktree), worktreePath],
-      {
-        cwd: this.config.repoRoot,
-        env: this.buildRuntimeEnvironment(port),
-        allowNonZeroExit: true
-      }
-    );
-    return await this.resolveRuntimeScriptsForWorktree(slot, worktreePath);
+    const bootstrapScript = await this.resolveBootstrapWorktreeScriptPath(worktreePath);
+    if (bootstrapScript) {
+      await runCommand("bash", [bootstrapScript, worktreePath], {
+        cwd: worktreePath,
+        env: this.buildRuntimeEnvironment(port)
+      });
+    }
+    const scripts = await this.resolveRuntimeScriptsForWorktree(slot, worktreePath);
+    if (!isPlaceholderScript(scripts.buildScript)) {
+      await runCommand("bash", ["-lc", scripts.buildScript], {
+        cwd: worktreePath,
+        env: this.buildRuntimeEnvironment(port)
+      });
+    }
+    return scripts;
   }
 
   private buildRuntimeEnvironment(port: number): NodeJS.ProcessEnv {
@@ -2570,6 +2635,60 @@ class FactorySupervisor {
       PORT: String(port),
       FACTORY_APP_PORT: String(port)
     };
+  }
+
+  private async resolveBootstrapWorktreeScriptPath(worktreePath: string): Promise<string | undefined> {
+    const worktreeConfig = await loadProjectConfig(worktreePath).catch(() => undefined);
+    const candidates = [
+      worktreeConfig?.scripts.bootstrapWorktree,
+      this.config.scripts.bootstrapWorktree,
+      "scripts/bootstrap-worktree.sh",
+      ".factory/scripts/bootstrap-worktree.sh"
+    ].filter((value): value is string => typeof value === "string" && value.trim().length > 0);
+
+    for (const candidate of candidates) {
+      const resolved = path.isAbsolute(candidate) ? candidate : path.resolve(worktreePath, candidate);
+      if (await fileExists(resolved)) {
+        return resolved;
+      }
+    }
+
+    return undefined;
+  }
+
+  private async stopOrphanRuntimeListeners(port: number): Promise<void> {
+    const result = await runCommand(
+      "bash",
+      ["-lc", `ss -ltnp '( sport = :${port} )'`],
+      {
+        cwd: this.config.repoRoot,
+        allowNonZeroExit: true
+      }
+    );
+    const pids = [...result.stdout.matchAll(/pid=(\d+)/g)]
+      .map((match) => Number.parseInt(match[1] ?? "", 10))
+      .filter((pid) => Number.isFinite(pid) && pid !== process.pid);
+
+    for (const pid of new Set(pids)) {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {
+        continue;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      try {
+        process.kill(pid, 0);
+      } catch {
+        continue;
+      }
+
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Ignore already-dead children.
+      }
+    }
   }
 
   private async runRuntimeHealthcheck(
@@ -2599,7 +2718,7 @@ class FactorySupervisor {
 
     await new Promise<void>((resolve, reject) => {
       this.stableProxyServer?.once("error", reject);
-      this.stableProxyServer?.listen(this.config.ports.stableProxy, "127.0.0.1", () => {
+      this.stableProxyServer?.listen(this.config.ports.stableProxy, "0.0.0.0", () => {
         this.stableProxyServer?.off("error", reject);
         resolve();
       });
@@ -2747,7 +2866,19 @@ class FactorySupervisor {
           : this.workerSchemaPath;
     const prompt = await readText(promptPath);
     const schema = await readText(schemaPath);
-    return `${prompt}\n\nReturn JSON only matching this schema:\n${schema}\n\nTask contract:\n${JSON.stringify(contract, null, 2)}\n`;
+    const specPath = contract.context.projectSpecPath ?? this.config.projectSpecPath;
+    const specExcerpt = contract.context.projectSpecExcerpt;
+    const projectGrounding = [
+      "Project grounding:",
+      `- canonical project spec path: ${specPath}`,
+      "- before you code, review, or test, read the repo's AGENTS.md and the project spec",
+      "- if current code drift conflicts with the spec and there is no newer user instruction overriding it, bias toward the spec"
+    ];
+    if (specExcerpt) {
+      projectGrounding.push("", "Project spec excerpt:", specExcerpt);
+    }
+
+    return `${prompt}\n\n${projectGrounding.join("\n")}\n\nReturn JSON only matching this schema:\n${schema}\n\nTask contract:\n${JSON.stringify(contract, null, 2)}\n`;
   }
 
   private async ensureAppServer(): Promise<void> {
@@ -2964,7 +3095,6 @@ class FactorySupervisor {
     request: http.IncomingMessage,
     response: http.ServerResponse
   ): Promise<void> {
-    const botToken = process.env[this.config.telegram.botTokenEnvVar];
     const expectedSecret = process.env[this.config.telegram.webhookSecretEnvVar];
     if (!expectedSecret) {
       response.writeHead(503, { "content-type": "application/json" });
@@ -2979,6 +3109,69 @@ class FactorySupervisor {
     }
 
     const update = await this.readJsonRequestBody(request);
+    await this.processTelegramUpdate(update);
+
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true }));
+  }
+
+  private async startTelegramPollingFallback(): Promise<void> {
+    if (this.telegramPollingTask) {
+      return;
+    }
+
+    const botToken = process.env[this.config.telegram.botTokenEnvVar];
+    if (!botToken || !this.config.telegram.controlChatId) {
+      return;
+    }
+
+    const webhookConfigured = await this.isTelegramWebhookConfigured(botToken);
+    if (webhookConfigured) {
+      return;
+    }
+
+    this.telegramPollingTask = this.runTelegramPollingLoop(botToken);
+  }
+
+  private async isTelegramWebhookConfigured(botToken: string): Promise<boolean> {
+    try {
+      const info = await sendTelegramApiRequest<{ url?: string }>(botToken, "getWebhookInfo", {});
+      return Boolean(info.url && info.url.trim().length > 0);
+    } catch (error) {
+      console.error(`telegram webhook probe failed: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+
+  private async runTelegramPollingLoop(botToken: string): Promise<void> {
+    let offset: number | undefined;
+
+    while (!this.stopRequested) {
+      try {
+        const updates = await pollTelegramUpdates(botToken, offset);
+        for (const update of updates) {
+          const updateId = typeof update.update_id === "number" ? update.update_id : undefined;
+          if (updateId !== undefined) {
+            offset = updateId + 1;
+          }
+          await this.processTelegramUpdate(update);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/webhook/i.test(message) && /getUpdates/i.test(message)) {
+          console.log("[telegram] polling fallback disabled because a webhook is configured");
+          return;
+        }
+        console.error(`telegram polling failed: ${message}`);
+        if (!this.stopRequested) {
+          await new Promise((resolve) => setTimeout(resolve, 5000));
+        }
+      }
+    }
+  }
+
+  private async processTelegramUpdate(update: Record<string, unknown>): Promise<void> {
+    const botToken = process.env[this.config.telegram.botTokenEnvVar];
     const message = update.message as
       | { message_id?: number; text?: string; chat?: { id?: string | number; type?: string }; from?: { id?: string | number } }
       | undefined;
@@ -3002,32 +3195,37 @@ class FactorySupervisor {
       const secretCommand = this.parseSecretCommand(message.text);
       if (secretCommand) {
         await this.handleSecretCommand(secretCommand, message.message_id ? String(message.message_id) : undefined);
-        response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({ ok: true }));
         return;
       }
 
-      const inboxId = randomId("inbox");
-      this.db.insertInboxItem({
-        id: inboxId,
-        projectId: this.config.projectId,
-        source: "telegram",
-        externalId: message.message_id ? String(message.message_id) : undefined,
-        receivedAt: nowIso(),
-        text: message.text,
-        status: "new"
-      });
-      this.db.insertTelegramMessage({
-        id: randomId("telegram"),
-        projectId: this.config.projectId,
-        telegramMessageId: message.message_id ? String(message.message_id) : undefined,
-        chatId: message.chat?.id ? String(message.chat.id) : undefined,
-        direction: "inbound",
-        kind: "message",
-        text: message.text
-      });
-      await this.interruptManagerIfRunning();
-      this.pendingManagerWakeReasons.add("telegram_message");
+      const externalId = message.message_id ? String(message.message_id) : undefined;
+      const alreadyQueued = externalId
+        ? this.db
+            .listInboxItems(this.config.projectId)
+            .some((item) => item.source === "telegram" && item.externalId === externalId)
+        : false;
+      if (!alreadyQueued) {
+        this.db.insertInboxItem({
+          id: randomId("inbox"),
+          projectId: this.config.projectId,
+          source: "telegram",
+          externalId,
+          receivedAt: nowIso(),
+          text: message.text,
+          status: "new"
+        });
+        this.db.insertTelegramMessage({
+          id: randomId("telegram"),
+          projectId: this.config.projectId,
+          telegramMessageId: externalId,
+          chatId: message.chat?.id ? String(message.chat.id) : undefined,
+          direction: "inbound",
+          kind: "message",
+          text: message.text
+        });
+        await this.interruptManagerIfRunning();
+        this.pendingManagerWakeReasons.add("telegram_message");
+      }
     }
 
     if (
@@ -3081,9 +3279,6 @@ class FactorySupervisor {
         }
       }
     }
-
-    response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({ ok: true }));
   }
 
   private parseSecretCommand(
