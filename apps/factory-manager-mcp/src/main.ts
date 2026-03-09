@@ -166,6 +166,7 @@ const inspectFactoryProcessesSchema = z
 const killFactoryProcessSchema = z
   .object({
     pid: z.number().int().positive(),
+    processKey: z.string().min(1).optional(),
     force: z.boolean().optional()
   })
   .strict();

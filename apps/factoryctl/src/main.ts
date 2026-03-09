@@ -10,6 +10,7 @@ import {
   currentCommit,
   ensureBranchFrom,
   fileExists,
+  getFactorydUnitName,
   getFactoryPaths,
   isGitRepo,
   loadEnvFile,
@@ -21,7 +22,6 @@ import {
   removePath,
   runCommand,
   sendTelegramApiRequest,
-  spawnLoggedProcess,
   withProjectLock,
   writeText
 } from "@permafactory/runtime";
@@ -505,13 +505,15 @@ async function handleStart(args: string[]): Promise<void> {
     options: {
       repo: { type: "string" },
       foreground: { type: "boolean" },
-      once: { type: "boolean" }
+      once: { type: "boolean" },
+      "trace-signals": { type: "boolean" }
     },
     strict: true
   });
 
   const repoRoot = path.resolve(requireString(parsed.values.repo, "--repo"));
   await loadRepoEnv(repoRoot);
+  const config = await loadProjectConfig(repoRoot);
   const factoryRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const factorydEntrypoint = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
@@ -536,8 +538,34 @@ async function handleStart(args: string[]): Promise<void> {
   }
 
   const paths = getFactoryPaths(repoRoot);
+  const unitName = getFactorydUnitName(config.projectId, repoRoot);
   const existingPidText = await readText(paths.supervisorPidPath).catch(() => undefined);
   const existingPid = existingPidText ? Number.parseInt(existingPidText.trim(), 10) : undefined;
+  const systemdRunAvailable =
+    (
+      await runCommand("bash", ["-lc", "command -v systemd-run >/dev/null 2>&1"], {
+        cwd: factoryRepoRoot,
+        allowNonZeroExit: true
+      })
+    ).exitCode === 0;
+  if (systemdRunAvailable) {
+    await runCommand("systemctl", ["--user", "reset-failed", unitName], {
+      cwd: factoryRepoRoot,
+      allowNonZeroExit: true
+    }).catch(() => undefined);
+
+    const unitActive =
+      (
+        await runCommand("systemctl", ["--user", "is-active", unitName], {
+          cwd: factoryRepoRoot,
+          allowNonZeroExit: true
+        })
+      ).exitCode === 0;
+    if (unitActive) {
+      console.log(`factoryd is already running for ${repoRoot} (${unitName})`);
+      return;
+    }
+  }
   if (existingPid && Number.isFinite(existingPid)) {
     try {
       process.kill(existingPid, 0);
@@ -548,15 +576,90 @@ async function handleStart(args: string[]): Promise<void> {
     }
   }
 
-  const spawned = await spawnLoggedProcess({
-    command: process.execPath,
-    args: commandArgs,
-    cwd: factoryRepoRoot,
-    stdoutPath: path.join(paths.logsDir, "factoryd.out.log"),
-    stderrPath: path.join(paths.logsDir, "factoryd.err.log"),
-    detached: true
-  });
-  console.log(`Started factoryd (pid ${spawned.pid ?? "unknown"})`);
+  const stdoutPath = path.join(paths.logsDir, "factoryd.out.log");
+  const stderrPath = path.join(paths.logsDir, "factoryd.err.log");
+  const signalTracePrefix = path.join(paths.logsDir, "factoryd.signal-trace");
+
+  if (systemdRunAvailable) {
+    const directExec = `exec ${shellEscape(process.execPath)} ${commandArgs.map(shellEscape).join(" ")} >>${shellEscape(stdoutPath)} 2>>${shellEscape(stderrPath)}`;
+    const tracedExec = [
+      `: > ${shellEscape(`${signalTracePrefix}.meta.log`)}`,
+      `echo \"trace_mode=exec started_at=$(date --iso-8601=seconds)\" >> ${shellEscape(`${signalTracePrefix}.meta.log`)}`,
+      `exec strace -ff -tt -s 256 -yy -e signal=all -o ${shellEscape(signalTracePrefix)} ${shellEscape(process.execPath)} ${commandArgs.map(shellEscape).join(" ")} >>${shellEscape(stdoutPath)} 2>>${shellEscape(stderrPath)}`
+    ].join("\n");
+    const envLines = [
+      `cd ${shellEscape(factoryRepoRoot)}`,
+      `export PATH=${shellEscape(process.env.PATH ?? "")}`,
+      `export HOME=${shellEscape(process.env.HOME ?? "")}`,
+      `export USER=${shellEscape(process.env.USER ?? "")}`,
+      `export SHELL=${shellEscape(process.env.SHELL ?? "")}`,
+      process.env.CODEX_HOME ? `export CODEX_HOME=${shellEscape(process.env.CODEX_HOME)}` : undefined,
+      parsed.values["trace-signals"] ? tracedExec : directExec
+    ]
+      .filter((line): line is string => Boolean(line))
+      .join("\n");
+
+    await runCommand(
+      "systemd-run",
+      [
+        "--user",
+        "--unit",
+        unitName,
+        "--collect",
+        "--property",
+        "Restart=always",
+        "--property",
+        "RestartSec=5s",
+        "--property",
+        "TimeoutStopSec=20s",
+        "--same-dir",
+        "--description",
+        `Permafactory daemon for ${config.projectId}`,
+        "bash",
+        "-lc",
+        envLines
+      ],
+      {
+        cwd: factoryRepoRoot
+      }
+    );
+
+    console.log(
+      parsed.values["trace-signals"]
+        ? `Started factoryd (${unitName}) with signal tracing to ${signalTracePrefix}.*`
+        : `Started factoryd (${unitName})`
+    );
+    return;
+  }
+
+  const launchResult = await runCommand(
+    "bash",
+    [
+      "-lc",
+      [
+        "exec 3>&1",
+        "if command -v setsid >/dev/null 2>&1; then",
+        '  setsid "$@" </dev/null >>"$PF_STDOUT" 2>>"$PF_STDERR" 3>&- &',
+        "else",
+        '  nohup "$@" </dev/null >>"$PF_STDOUT" 2>>"$PF_STDERR" 3>&- &',
+        "fi",
+        "echo $! >&3"
+      ].join("\n"),
+      "permafactory-factoryd",
+      process.execPath,
+      ...commandArgs
+    ],
+    {
+      cwd: factoryRepoRoot,
+      env: {
+        PF_STDOUT: stdoutPath,
+        PF_STDERR: stderrPath
+      }
+    }
+  );
+
+  const startedPid = Number.parseInt(launchResult.stdout.trim().split(/\s+/).pop() ?? "", 10);
+  console.log(`Started factoryd (pid ${Number.isFinite(startedPid) ? startedPid : "unknown"})`);
 }
 
 async function handleStop(args: string[]): Promise<void> {
@@ -573,6 +676,7 @@ async function handleStop(args: string[]): Promise<void> {
   await loadRepoEnv(repoRoot);
   const config = await loadProjectConfig(repoRoot);
   const paths = getFactoryPaths(repoRoot);
+  const unitName = getFactorydUnitName(config.projectId, repoRoot);
   const supervisorPidText = await readText(paths.supervisorPidPath).catch(() => "");
   const supervisorPid = Number.parseInt(supervisorPidText.trim(), 10);
   const knownPorts = [
@@ -590,6 +694,25 @@ async function handleStop(args: string[]): Promise<void> {
   } catch {
     attemptedGracefulStop = false;
   }
+
+  const unitActive =
+    (
+      await runCommand("systemctl", ["--user", "is-active", unitName], {
+        cwd: repoRoot,
+        allowNonZeroExit: true
+      }).catch(() => ({ exitCode: 1, stdout: "", stderr: "" }))
+    ).exitCode === 0;
+
+  if (unitActive) {
+    await runCommand("systemctl", ["--user", "stop", unitName], {
+      cwd: repoRoot,
+      allowNonZeroExit: true
+    }).catch(() => undefined);
+  }
+  await runCommand("systemctl", ["--user", "reset-failed", unitName], {
+    cwd: repoRoot,
+    allowNonZeroExit: true
+  }).catch(() => undefined);
 
   if (Number.isFinite(supervisorPid)) {
     if (!attemptedGracefulStop) {
@@ -625,6 +748,10 @@ async function handleStop(args: string[]): Promise<void> {
   }
 
   console.log(`Stopped factoryd for ${repoRoot}`);
+}
+
+function shellEscape(value: string): string {
+  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
 async function requestDashboardStop(config: FactoryProjectConfig): Promise<boolean> {

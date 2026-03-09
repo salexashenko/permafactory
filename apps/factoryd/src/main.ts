@@ -1,9 +1,10 @@
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { open } from "node:fs/promises";
+import { appendFileSync, writeFileSync } from "node:fs";
+import { open, readlink, readdir, rm } from "node:fs/promises";
 import process from "node:process";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -153,6 +154,10 @@ interface ProcessSnapshot {
   elapsedSeconds: number;
   cpuPercent: number;
   memoryPercent: number;
+  processKey: string;
+  startTicks?: number;
+  cwd?: string;
+  exe?: string;
   args: string;
   command: string;
 }
@@ -170,8 +175,176 @@ interface FactoryProcessRecord extends ProcessSnapshot {
   ownerKind: "supervisor" | "manager" | "task" | "runtime" | "unknown";
   ownerId?: string;
   rootPid?: number;
+  rootProcessKey?: string;
+  rootCwd?: string;
   active: boolean;
   stale: boolean;
+  protected: boolean;
+  killable: boolean;
+}
+
+function serializeLifecycleValue(value: unknown): unknown {
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      message: value.message,
+      stack: value.stack
+    };
+  }
+
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => serializeLifecycleValue(entry));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, serializeLifecycleValue(entry)])
+    );
+  }
+
+  return value;
+}
+
+function appendLifecycleEntry(
+  logPath: string,
+  event: string,
+  details: Record<string, unknown> = {}
+): void {
+  try {
+    const serializedDetails = serializeLifecycleValue(details);
+    appendFileSync(
+      logPath,
+      `${JSON.stringify({
+        at: nowIso(),
+        pid: process.pid,
+        event,
+        ...(serializedDetails && typeof serializedDetails === "object"
+          ? (serializedDetails as Record<string, unknown>)
+          : { details: serializedDetails })
+      })}\n`,
+      "utf8"
+    );
+  } catch {
+    // Ignore best-effort lifecycle logging failures.
+  }
+}
+
+function writeHeartbeatSnapshot(filePath: string, payload: Record<string, unknown>): void {
+  try {
+    const serializedPayload = serializeLifecycleValue(payload);
+    writeFileSync(
+      filePath,
+      `${JSON.stringify({
+        at: nowIso(),
+        pid: process.pid,
+        ...(serializedPayload && typeof serializedPayload === "object"
+          ? (serializedPayload as Record<string, unknown>)
+          : { payload: serializedPayload })
+      }, null, 2)}\n`,
+      "utf8"
+    );
+  } catch {
+    // Ignore best-effort heartbeat write failures.
+  }
+}
+
+function readPsFields(pid: number, fields: string[]): string | undefined {
+  try {
+    const output = execFileSync("ps", ["-o", `${fields.join(",")}=`, "-p", String(pid)], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim();
+    return output.length > 0 ? output : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function getProcessIdentitySnapshot(): Record<string, unknown> {
+  const identity: Record<string, unknown> = {
+    ppid: process.ppid
+  };
+
+  const processFields = readPsFields(process.pid, ["pgid", "sid", "command"]);
+  if (processFields) {
+    const match = processFields.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/s);
+    if (match) {
+      identity.pgid = Number.parseInt(match[1] ?? "", 10);
+      identity.sid = Number.parseInt(match[2] ?? "", 10);
+      identity.command = match[3]?.trim();
+    }
+  }
+
+  const parentCommand = readPsFields(process.ppid, ["command"]);
+  if (parentCommand) {
+    identity.parentCommand = parentCommand.trim();
+  }
+
+  return identity;
+}
+
+function installProcessDiagnostics(paths: ReturnType<typeof getFactoryPaths>): () => void {
+  const logEvent = (event: string, details: Record<string, unknown> = {}) => {
+    appendLifecycleEntry(paths.lifecycleLogPath, event, details);
+  };
+  const writeHeartbeat = (phase: string, details: Record<string, unknown> = {}) => {
+    writeHeartbeatSnapshot(paths.heartbeatPath, { phase, ...details });
+  };
+
+  const onUnhandledRejection = (reason: unknown) => {
+    logEvent("unhandled_rejection", { reason });
+    writeHeartbeat("unhandled_rejection", { reason });
+  };
+  const onUncaughtExceptionMonitor = (error: Error, origin: string) => {
+    logEvent("uncaught_exception_monitor", { origin, error });
+    writeHeartbeat("uncaught_exception_monitor", { origin, error });
+  };
+  const onBeforeExit = (code: number) => {
+    logEvent("before_exit", { code });
+    writeHeartbeat("before_exit", { code });
+  };
+  const onExit = (code: number) => {
+    logEvent("exit", { code });
+  };
+  const onSigterm = () => {
+    logEvent("signal", { signal: "SIGTERM" });
+    writeHeartbeat("signal", { signal: "SIGTERM" });
+  };
+  const onSigint = () => {
+    logEvent("signal", { signal: "SIGINT" });
+    writeHeartbeat("signal", { signal: "SIGINT" });
+  };
+
+  logEvent("process_bootstrap", {
+    argv: process.argv.slice(2),
+    cwd: process.cwd(),
+    ...getProcessIdentitySnapshot()
+  });
+  writeHeartbeat("process_bootstrap", {
+    argv: process.argv.slice(2),
+    cwd: process.cwd(),
+    ...getProcessIdentitySnapshot()
+  });
+
+  process.on("unhandledRejection", onUnhandledRejection);
+  process.on("uncaughtExceptionMonitor", onUncaughtExceptionMonitor);
+  process.on("beforeExit", onBeforeExit);
+  process.on("exit", onExit);
+  process.on("SIGTERM", onSigterm);
+  process.on("SIGINT", onSigint);
+
+  return () => {
+    process.off("unhandledRejection", onUnhandledRejection);
+    process.off("uncaughtExceptionMonitor", onUncaughtExceptionMonitor);
+    process.off("beforeExit", onBeforeExit);
+    process.off("exit", onExit);
+    process.off("SIGTERM", onSigterm);
+    process.off("SIGINT", onSigint);
+  };
 }
 
 class InterruptedTurnError extends Error {
@@ -196,6 +369,10 @@ async function main(): Promise<void> {
   });
 
   const repoRoot = path.resolve(parsed.values.repo ?? process.cwd());
+  const paths = getFactoryPaths(repoRoot);
+  await ensureDir(paths.factoryRoot);
+  await ensureDir(paths.logsDir);
+  const removeDiagnostics = installProcessDiagnostics(paths);
   await loadEnvFile(path.join(repoRoot, ".env.factory"));
   const config = await loadProjectConfig(repoRoot);
   const db = await FactoryDatabase.open(repoRoot);
@@ -210,6 +387,7 @@ async function main(): Promise<void> {
   try {
     await supervisor.run(Boolean(parsed.values.once));
   } finally {
+    removeDiagnostics();
     process.off("SIGTERM", handleStopSignal);
     process.off("SIGINT", handleStopSignal);
   }
@@ -492,6 +670,37 @@ class FactorySupervisor {
     this.testerPromptPath = path.resolve(this.factoryRepoRoot, "prompts/tester.md");
   }
 
+  private getLifecycleSnapshot(): Record<string, unknown> {
+    const summary = this.db.getTaskActivitySummary(this.config.projectId);
+    return {
+      projectId: this.config.projectId,
+      repoRoot: this.config.repoRoot,
+      managerRunning: this.managerRunning,
+      stopRequested: this.stopRequested,
+      shuttingDown: this.shuttingDown,
+      activeManagerThreadId: this.activeManagerThreadId,
+      activeManagerTurnId: this.activeManagerTurnId,
+      pendingWakeReasons: [...this.pendingManagerWakeReasons],
+      tasks: summary.tasks,
+      activeRuns: summary.activeRuns
+    };
+  }
+
+  private logLifecycle(event: string, details: Record<string, unknown> = {}): void {
+    appendLifecycleEntry(this.paths.lifecycleLogPath, event, {
+      ...this.getLifecycleSnapshot(),
+      ...details
+    });
+  }
+
+  private writeHeartbeat(phase: string, details: Record<string, unknown> = {}): void {
+    writeHeartbeatSnapshot(this.paths.heartbeatPath, {
+      ...this.getLifecycleSnapshot(),
+      phase,
+      ...details
+    });
+  }
+
   async run(once: boolean): Promise<void> {
     this.stopRequested = false;
     this.shuttingDown = false;
@@ -502,6 +711,8 @@ class FactorySupervisor {
     await ensureDir(this.paths.runsDir);
     await this.ensureManagerToolToken();
     await this.claimSupervisorPid();
+    this.logLifecycle("run_started", { once });
+    this.writeHeartbeat("run_started", { once });
 
     try {
       await this.refreshProjectState();
@@ -513,10 +724,12 @@ class FactorySupervisor {
       do {
         await this.tick();
         if (!once && !this.stopRequested) {
+          this.writeHeartbeat("tick_wait");
           await this.waitForNextTickOrStop();
         }
       } while (!once && !this.stopRequested);
     } finally {
+      this.logLifecycle("run_finally");
       await this.requestShutdown("run_finally").catch(() => undefined);
       await this.telegramPollingTask?.catch(() => undefined);
       await this.releaseSupervisorPid();
@@ -556,6 +769,8 @@ class FactorySupervisor {
     this.shuttingDown = true;
     this.stopRequested = true;
     this.pendingManagerWakeReasons.clear();
+    this.logLifecycle("shutdown_started", { reason });
+    this.writeHeartbeat("shutdown_started", { reason });
 
     await this.interruptManagerIfRunning().catch(() => undefined);
 
@@ -647,6 +862,8 @@ class FactorySupervisor {
     this.activeManagerTurnId = undefined;
     this.activeManagerThreadId = undefined;
     this.managerRunning = false;
+    this.logLifecycle("shutdown_completed", { reason });
+    this.writeHeartbeat("shutdown_completed", { reason });
   }
 
   private async ensureManagerToolToken(): Promise<void> {
@@ -666,6 +883,7 @@ class FactorySupervisor {
     if (this.stopRequested) {
       return;
     }
+    this.writeHeartbeat("tick_started");
     this.config = await loadProjectConfig(this.config.repoRoot);
     this.db.upsertProject(this.config);
     await this.refreshProjectState();
@@ -705,6 +923,7 @@ class FactorySupervisor {
       return;
     }
     await this.startQueuedTasksIfPossible();
+    this.writeHeartbeat("tick_completed");
   }
 
   private async waitForNextTickOrStop(): Promise<void> {
@@ -741,9 +960,52 @@ class FactorySupervisor {
   private maybeWakeManagerForContinuity(): void {
     const tasks = this.db.listTasks(this.config.projectId);
     const agents = this.db.listAgents(this.config.projectId);
-    const hasActiveTask = tasks.some((task) => ["queued", "running", "review"].includes(task.status));
-    const hasRunningWorker = agents.some((agent) => agent.role !== "manager" && agent.status === "running");
-    if (hasActiveTask || hasRunningWorker) {
+    const runningWorkers = agents.filter((agent) => agent.role !== "manager" && agent.status === "running");
+    const hasRunningWorker = runningWorkers.length > 0;
+    const runningTaskIds = new Set(
+      runningWorkers
+        .filter((agent) => agent.taskId)
+        .map((agent) => agent.taskId as string)
+    );
+    const runningBranchNames = new Set(
+      runningWorkers
+        .map((agent) => agent.branch?.trim())
+        .filter((branch): branch is string => Boolean(branch))
+    );
+    const runningWorktreePaths = new Set(
+      runningWorkers
+        .map((agent) => agent.worktreePath?.trim())
+        .filter((worktreePath): worktreePath is string => Boolean(worktreePath))
+    );
+    const hasEquivalentRunningWorker = (task: (typeof tasks)[number]): boolean => {
+      if (runningTaskIds.has(task.id)) {
+        return true;
+      }
+      if (task.branchName && runningBranchNames.has(task.branchName.trim())) {
+        return true;
+      }
+      if (task.worktreePath && runningWorktreePaths.has(task.worktreePath.trim())) {
+        return true;
+      }
+      return false;
+    };
+    const hasQueuedTask = tasks.some((task) => task.status === "queued");
+    const hasTrackedActiveTask = tasks.some(
+      (task) => (task.status === "running" || task.status === "review") && hasEquivalentRunningWorker(task)
+    );
+    const orphanGraceMs = Math.max(this.config.scheduler.tickSeconds * 1000, 30_000);
+    const hasOrphanedActiveTask = tasks.some((task) => {
+      if (task.status !== "running" && task.status !== "review") {
+        return false;
+      }
+      if (hasEquivalentRunningWorker(task)) {
+        return false;
+      }
+      const updatedAtMs = Date.parse(task.updatedAt);
+      return Number.isFinite(updatedAtMs) && Date.now() - updatedAtMs >= orphanGraceMs;
+    });
+
+    if ((hasQueuedTask || hasTrackedActiveTask || hasRunningWorker) && !hasOrphanedActiveTask) {
       return;
     }
 
@@ -752,7 +1014,7 @@ class FactorySupervisor {
       return;
     }
 
-    this.pendingManagerWakeReasons.add("no_active_work");
+    this.pendingManagerWakeReasons.add(hasOrphanedActiveTask ? "orphaned_active_task" : "no_active_work");
     this.lastNoActiveWorkWakeAt = Date.now();
   }
 
@@ -764,6 +1026,8 @@ class FactorySupervisor {
       this.managerThreadNeedsRotation = true;
       wakeReasons.push("manager_thread_rotation");
     }
+    this.logLifecycle("manager_turn_requested", { wakeReasons });
+    this.writeHeartbeat("manager_turn_requested", { wakeReasons });
 
     try {
       await this.ensureAppServer();
@@ -805,6 +1069,18 @@ class FactorySupervisor {
         this.config.scheduler.managerStallSeconds * 1000
       );
       this.activeManagerTurnId = startedTurn.turnId;
+      this.logLifecycle("manager_turn_started", {
+        threadId,
+        turnId: startedTurn.turnId,
+        wakeReasons,
+        userMessages: input.userMessages.length
+      });
+      this.writeHeartbeat("manager_turn_started", {
+        threadId,
+        turnId: startedTurn.turnId,
+        wakeReasons,
+        userMessages: input.userMessages.length
+      });
       this.db.upsertAgent({
         id: "manager",
         projectId: this.config.projectId,
@@ -837,6 +1113,16 @@ class FactorySupervisor {
       for (const inboxItem of this.db.listInboxItems(this.config.projectId, ["new"])) {
         this.db.markInboxItemStatus(inboxItem.id, "triaged");
       }
+      this.logLifecycle("manager_turn_completed", {
+        threadId,
+        turnId: startedTurn.turnId,
+        summary: validated.value.summary
+      });
+      this.writeHeartbeat("manager_turn_completed", {
+        threadId,
+        turnId: startedTurn.turnId,
+        summary: validated.value.summary
+      });
 
       this.db.upsertAgent({
         id: "manager",
@@ -848,6 +1134,14 @@ class FactorySupervisor {
       });
     } catch (error) {
       if (error instanceof InterruptedTurnError) {
+        this.logLifecycle("manager_turn_interrupted", {
+          threadId: error.threadId,
+          turnId: error.turnId
+        });
+        this.writeHeartbeat("manager_turn_interrupted", {
+          threadId: error.threadId,
+          turnId: error.turnId
+        });
         this.db.upsertAgent({
           id: "manager",
           projectId: this.config.projectId,
@@ -860,6 +1154,14 @@ class FactorySupervisor {
       }
 
       const restartPlanned = await this.recoverManagerFailure(error);
+      this.logLifecycle("manager_turn_failed", {
+        error,
+        restartPlanned
+      });
+      this.writeHeartbeat("manager_turn_failed", {
+        error,
+        restartPlanned
+      });
 
       this.db.upsertAgent({
         id: "manager",
@@ -875,6 +1177,7 @@ class FactorySupervisor {
       this.activeManagerHasDirectUserMessage = false;
       this.activeManagerReplyToMessageId = undefined;
       this.managerRunning = false;
+      this.writeHeartbeat("manager_turn_idle");
     }
   }
 
@@ -1348,20 +1651,7 @@ class FactorySupervisor {
     }
 
     const appServerPid = await this.findListenerPidForUrl(this.config.codex.appServerUrl);
-    const keepRootPids = new Set<number>();
-    if (this.appServerProcess?.pid && this.isProcessAlive(this.appServerProcess.pid)) {
-      keepRootPids.add(this.appServerProcess.pid);
-    }
-    for (const child of this.workerChildren.values()) {
-      if (child.pid && this.isProcessAlive(child.pid)) {
-        keepRootPids.add(child.pid);
-      }
-    }
-    for (const runtime of this.runtimeProcesses.values()) {
-      if (runtime.child.pid && this.isProcessAlive(runtime.child.pid)) {
-        keepRootPids.add(runtime.child.pid);
-      }
-    }
+    const keepRootPids = this.collectProtectedRootPids();
 
     if (appServerPid && !keepRootPids.has(appServerPid)) {
       await this.terminateProcessTree(appServerPid);
@@ -1387,6 +1677,9 @@ class FactorySupervisor {
     }
 
     for (const pid of staleRoots) {
+      if (keepRootPids.has(pid)) {
+        continue;
+      }
       await this.terminateProcessTree(pid);
       console.warn(`Reaped stale factory process tree rooted at pid ${pid}`);
     }
@@ -1429,6 +1722,47 @@ class FactorySupervisor {
     return pidMatch ? Number.parseInt(pidMatch[1] ?? "", 10) : undefined;
   }
 
+  private async readProcLink(pid: number, linkName: "cwd" | "exe"): Promise<string | undefined> {
+    try {
+      return await readlink(`/proc/${pid}/${linkName}`);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async readProcessStartTicks(pid: number): Promise<number | undefined> {
+    const statText = await readText(`/proc/${pid}/stat`).catch(() => "");
+    if (!statText) {
+      return undefined;
+    }
+
+    const closeParenIndex = statText.lastIndexOf(")");
+    if (closeParenIndex === -1 || closeParenIndex + 2 >= statText.length) {
+      return undefined;
+    }
+
+    const fields = statText.slice(closeParenIndex + 2).trim().split(/\s+/);
+    const startTicksText = fields[19];
+    if (!startTicksText) {
+      return undefined;
+    }
+
+    const startTicks = Number.parseInt(startTicksText, 10);
+    return Number.isFinite(startTicks) ? startTicks : undefined;
+  }
+
+  private inferRuntimeSlotFromPath(pathText?: string): RuntimeSlotName | undefined {
+    if (!pathText) {
+      return undefined;
+    }
+    const relative = path.relative(this.paths.runtimeDir, pathText);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      return undefined;
+    }
+    const slot = relative.split(path.sep, 1)[0];
+    return slot === "stable-a" || slot === "stable-b" || slot === "preview" ? slot : undefined;
+  }
+
   private async listSystemProcesses(): Promise<ProcessSnapshot[]> {
     const result = await runCommand(
       "ps",
@@ -1438,7 +1772,7 @@ class FactorySupervisor {
         allowNonZeroExit: true
       }
     );
-    return result.stdout
+    const parsed = result.stdout
       .split(/\r?\n/)
       .map((line) => line.trim())
       .filter((line) => line.length > 0)
@@ -1455,11 +1789,29 @@ class FactorySupervisor {
           elapsedSeconds: Number.parseInt(elapsedText ?? "", 10),
           cpuPercent: Number.parseFloat(cpuText ?? "0") || 0,
           memoryPercent: Number.parseFloat(memText ?? "0") || 0,
+          processKey: `${pidText ?? ""}:unknown`,
           args: argsText,
           command: argsText.split(/\s+/, 1)[0] ?? argsText
         } satisfies ProcessSnapshot;
       })
       .filter((entry): entry is ProcessSnapshot => Boolean(entry));
+
+    return await Promise.all(
+      parsed.map(async (entry) => {
+        const [startTicks, cwd, exe] = await Promise.all([
+          this.readProcessStartTicks(entry.pid),
+          this.readProcLink(entry.pid, "cwd"),
+          this.readProcLink(entry.pid, "exe")
+        ]);
+        return {
+          ...entry,
+          processKey: `${entry.pid}:${startTicks ?? "unknown"}`,
+          startTicks,
+          cwd,
+          exe
+        } satisfies ProcessSnapshot;
+      })
+    );
   }
 
   private collectDescendantPids(rootPid: number, childrenByParent: Map<number, number[]>): Set<number> {
@@ -1495,29 +1847,22 @@ class FactorySupervisor {
       childrenByParent.set(processInfo.ppid, siblings);
     }
 
-    const activeWorkerRoots = new Map<number, string>();
-    for (const [taskId, child] of this.workerChildren.entries()) {
-      if (child.pid && this.isProcessAlive(child.pid)) {
-        activeWorkerRoots.set(child.pid, taskId);
-      }
-    }
-    const runtimeRoots = new Map<number, RuntimeSlotName>();
-    for (const [slot, runtime] of this.runtimeProcesses.entries()) {
-      if (runtime.child.pid && this.isProcessAlive(runtime.child.pid)) {
-        runtimeRoots.set(runtime.child.pid, slot);
-      }
-    }
+    const activeWorkerRoots = this.collectActiveWorkerRoots();
+    const runtimeRoots = this.collectRuntimeRoots();
 
     const appServerPid = await this.findListenerPidForUrl(this.config.codex.appServerUrl);
     const currentAppServerPid =
       this.appServerProcess?.pid && this.isProcessAlive(this.appServerProcess.pid)
         ? this.appServerProcess.pid
         : undefined;
+    // Prefer specific tracked roots before the supervisor so descendants are
+    // attributed to the component that actually owns them.
+    const protectedRootPids = this.collectProtectedRootPids(activeWorkerRoots, runtimeRoots);
     const knownRoots = new Set<number>([
-      process.pid,
       ...(appServerPid ? [appServerPid] : []),
       ...activeWorkerRoots.keys(),
-      ...runtimeRoots.keys()
+      ...runtimeRoots.keys(),
+      process.pid
     ]);
 
     const descendantToRoot = new Map<number, number>();
@@ -1534,6 +1879,7 @@ class FactorySupervisor {
         return true;
       }
       if (
+        this.inferRuntimeSlotFromPath(processInfo.cwd) ||
         processInfo.args.includes("chrome-devtools-mcp") ||
         processInfo.args.includes("apps/factory-manager-mcp/src/main.ts") ||
         (processInfo.args.includes("/opt/google/chrome/chrome") &&
@@ -1553,6 +1899,8 @@ class FactorySupervisor {
       let ownerKind: FactoryProcessRecord["ownerKind"] = "unknown";
       let ownerId: string | undefined;
       let active = false;
+      const inferredRuntimeSlot =
+        this.inferRuntimeSlotFromPath(processInfo.cwd) ?? this.inferRuntimeSlotFromPath(rootProcess?.cwd);
 
       if (processInfo.pid === process.pid) {
         kind = "supervisor";
@@ -1584,6 +1932,10 @@ class FactorySupervisor {
         ownerKind = "runtime";
         ownerId = runtimeRoots.get(rootPid);
         active = true;
+      } else if (inferredRuntimeSlot) {
+        kind = "runtime";
+        ownerKind = "runtime";
+        ownerId = inferredRuntimeSlot;
       } else if (processInfo.args.includes("chrome-devtools-mcp")) {
         kind = "browser_mcp";
       } else if (processInfo.args.includes("apps/factory-manager-mcp/src/main.ts")) {
@@ -1597,6 +1949,14 @@ class FactorySupervisor {
       const stale =
         !active &&
         (kind === "app_server" || kind === "manager_mcp" || kind === "browser_mcp" || kind === "chrome");
+      const effectiveStale =
+        stale ||
+        (kind === "app_server" &&
+          processInfo.pid === appServerPid &&
+          currentAppServerPid !== undefined &&
+          processInfo.pid !== currentAppServerPid);
+      const protectedProcess = protectedRootPids.has(rootPid) || protectedRootPids.has(processInfo.pid);
+      const killable = effectiveStale && !protectedProcess && kind !== "supervisor";
 
       return {
         ...processInfo,
@@ -1605,13 +1965,12 @@ class FactorySupervisor {
         ownerKind,
         ownerId,
         rootPid,
+        rootProcessKey: rootProcess?.processKey,
+        rootCwd: rootProcess?.cwd,
         active,
-        stale:
-          stale ||
-          (kind === "app_server" &&
-            processInfo.pid === appServerPid &&
-            currentAppServerPid !== undefined &&
-            processInfo.pid !== currentAppServerPid)
+        stale: effectiveStale,
+        protected: protectedProcess,
+        killable
       } satisfies FactoryProcessRecord;
     });
 
@@ -1657,6 +2016,43 @@ class FactorySupervisor {
     } catch {
       return false;
     }
+  }
+
+  private collectActiveWorkerRoots(): Map<number, string> {
+    const activeWorkerRoots = new Map<number, string>();
+    for (const [taskId, child] of this.workerChildren.entries()) {
+      if (child.pid && this.isProcessAlive(child.pid)) {
+        activeWorkerRoots.set(child.pid, taskId);
+      }
+    }
+    return activeWorkerRoots;
+  }
+
+  private collectRuntimeRoots(): Map<number, RuntimeSlotName> {
+    const runtimeRoots = new Map<number, RuntimeSlotName>();
+    for (const [slot, runtime] of this.runtimeProcesses.entries()) {
+      if (runtime.child.pid && this.isProcessAlive(runtime.child.pid)) {
+        runtimeRoots.set(runtime.child.pid, slot);
+      }
+    }
+    return runtimeRoots;
+  }
+
+  private collectProtectedRootPids(
+    activeWorkerRoots = this.collectActiveWorkerRoots(),
+    runtimeRoots = this.collectRuntimeRoots()
+  ): Set<number> {
+    const protectedRoots = new Set<number>([process.pid]);
+    if (this.appServerProcess?.pid && this.isProcessAlive(this.appServerProcess.pid)) {
+      protectedRoots.add(this.appServerProcess.pid);
+    }
+    for (const pid of activeWorkerRoots.keys()) {
+      protectedRoots.add(pid);
+    }
+    for (const pid of runtimeRoots.keys()) {
+      protectedRoots.add(pid);
+    }
+    return protectedRoots;
   }
 
   private async applyManagerOutput(
@@ -1978,6 +2374,8 @@ class FactorySupervisor {
       }
       case "kill_factory_process": {
         const pid = Number(args.pid);
+        const expectedProcessKey =
+          typeof args.processKey === "string" && args.processKey.length > 0 ? args.processKey : undefined;
         if (!Number.isInteger(pid) || pid <= 0) {
           throw new Error("Missing required integer argument: pid");
         }
@@ -1986,6 +2384,16 @@ class FactorySupervisor {
         if (!target) {
           throw new Error(`Refused to kill pid ${pid}; it is not currently recognized as a factory-owned process`);
         }
+        if (expectedProcessKey && target.processKey !== expectedProcessKey) {
+          throw new Error(
+            `Refused to kill pid ${pid}; process identity changed from ${expectedProcessKey} to ${target.processKey}`
+          );
+        }
+        if (!target.killable) {
+          throw new Error(
+            `Refused to kill pid ${pid}; kind=${target.kind} active=${target.active} stale=${target.stale} protected=${target.protected}`
+          );
+        }
         await this.terminateProcessTree(pid);
         return {
           pid,
@@ -1993,6 +2401,8 @@ class FactorySupervisor {
           ownerKind: target.ownerKind,
           ownerId: target.ownerId,
           stale: target.stale,
+          protected: target.protected,
+          killable: target.killable,
           alive: this.isProcessAlive(pid)
         };
       }
@@ -2449,6 +2859,30 @@ class FactorySupervisor {
     await this.startWorker(normalized, normalized.kind === "test" ? "test" : "code");
   }
 
+  private async ensureInjectedWorktreeFiles(worktreePath: string): Promise<void> {
+    for (const relativePath of ["AGENTS.md"]) {
+      const sourcePath = path.join(this.config.repoRoot, relativePath);
+      const targetPath = path.join(worktreePath, relativePath);
+      if (!(await fileExists(sourcePath)) || (await fileExists(targetPath))) {
+        continue;
+      }
+      await writeText(targetPath, await readText(sourcePath));
+    }
+  }
+
+  private async removeInjectedOnlyWorktreePathIfSafe(worktreePath: string): Promise<void> {
+    if (!(await fileExists(worktreePath))) {
+      return;
+    }
+    if (await fileExists(path.join(worktreePath, ".git"))) {
+      return;
+    }
+    const entries = await readdir(worktreePath).catch(() => []);
+    if (entries.length === 0 || entries.every((entry) => entry === "AGENTS.md")) {
+      await rm(worktreePath, { recursive: true, force: true });
+    }
+  }
+
   private async reconcileCompletedTaskBranches(): Promise<void> {
     for (const task of this.db.listTasks(this.config.projectId)) {
       if (!task.contract || !["done", "review"].includes(task.status) || !task.worktreePath) {
@@ -2536,7 +2970,7 @@ class FactorySupervisor {
     await runCommand("git", ["add", "-A", "--", "."], {
       cwd: contract.worktreePath
     });
-    await runCommand("git", ["reset", "--", ".factory.env"], {
+    await runCommand("git", ["reset", "--", ".factory.env", "AGENTS.md"], {
       cwd: contract.worktreePath,
       allowNonZeroExit: true
     });
@@ -2574,7 +3008,7 @@ class FactorySupervisor {
       .map((line) => line.trimEnd())
       .filter((line) => line.length > 0)
       .map((line) => line.slice(3).split(" -> ").at(-1)?.trim() ?? "")
-      .filter((file) => file.length > 0 && file !== ".factory.env");
+      .filter((file) => file.length > 0 && file !== ".factory.env" && file !== "AGENTS.md");
   }
 
   private getLatestTaskEvent(taskId: string): { at: string; type: string; summary: string; payload?: Record<string, unknown> } | undefined {
@@ -2680,6 +3114,16 @@ class FactorySupervisor {
           "failed",
           `Task failed to start: ${error instanceof Error ? error.message : String(error)}`
         );
+        this.logLifecycle("task_start_failed", {
+          taskId: task.id,
+          role: task.kind === "test" ? "test" : "code",
+          error
+        });
+        this.writeHeartbeat("task_start_failed", {
+          taskId: task.id,
+          role: task.kind === "test" ? "test" : "code",
+          error
+        });
         console.error(`task ${task.id} failed to start: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
@@ -2691,13 +3135,13 @@ class FactorySupervisor {
   ): Promise<void> {
     const workerSandboxCapabilities = await this.ensureWorkerSandboxCapabilities();
     const projectSpecExcerpt = await this.loadProjectSpecExcerpt();
+    const existingTaskRecord = this.db.getTask(contract.id);
     const worktreeId = contract.id;
     const worktreePath = contract.worktreePath;
     const branchName = contract.branchName;
     const baseBranch = contract.baseBranch || this.config.candidateBranch;
     const reusesExistingWorktree =
-      role === "review" &&
-      this.db.getTask(contract.id)?.worktreePath === worktreePath &&
+      existingTaskRecord?.worktreePath === worktreePath &&
       (await fileExists(path.join(worktreePath, ".git")));
     const requirement = reusesExistingWorktree
       ? { app: false, e2e: false }
@@ -2723,6 +3167,7 @@ class FactorySupervisor {
       }
     };
     if (!reusesExistingWorktree) {
+      await this.removeInjectedOnlyWorktreePathIfSafe(worktreePath);
       await ensureDir(path.dirname(worktreePath));
       await addWorktree(this.config.repoRoot, worktreePath, branchName, baseBranch);
       const baseCommit = await currentCommit(this.config.repoRoot, baseBranch);
@@ -2772,6 +3217,7 @@ class FactorySupervisor {
         allowNonZeroExit: true
       });
     }
+    await this.ensureInjectedWorktreeFiles(worktreePath);
 
     const runId = randomId("run");
     const runDir = path.join(this.paths.runsDir, runId);
@@ -2824,6 +3270,22 @@ class FactorySupervisor {
     stderrFd.close().catch(() => undefined);
     child.stdin?.write(prompt);
     child.stdin?.end();
+    this.logLifecycle("worker_spawned", {
+      taskId: normalized.id,
+      role,
+      branchName,
+      worktreePath,
+      runId,
+      pid: child.pid
+    });
+    this.writeHeartbeat("worker_spawned", {
+      taskId: normalized.id,
+      role,
+      branchName,
+      worktreePath,
+      runId,
+      pid: child.pid
+    });
 
     this.workerChildren.set(normalized.id, child);
     this.db.insertRun({
@@ -2854,7 +3316,23 @@ class FactorySupervisor {
     }
     this.db.insertTaskEvent(normalized.id, "started", `Started ${role} worker`);
 
-    child.on("exit", async () => {
+    child.on("exit", async (code, signal) => {
+      this.logLifecycle("worker_process_exit", {
+        taskId: normalized.id,
+        role,
+        runId,
+        pid: child.pid,
+        code,
+        signal
+      });
+      this.writeHeartbeat("worker_process_exit", {
+        taskId: normalized.id,
+        role,
+        runId,
+        pid: child.pid,
+        code,
+        signal
+      });
       try {
         if (this.shuttingDown) {
           this.db.finishRun(runId, "failed");
@@ -2865,6 +3343,12 @@ class FactorySupervisor {
           jsonlLogPath
         });
       } catch (error) {
+        this.logLifecycle("worker_exit_handling_failed", {
+          taskId: normalized.id,
+          role,
+          runId,
+          error
+        });
         console.error(`worker exit handling failed: ${error instanceof Error ? error.message : String(error)}`);
       } finally {
         this.workerChildren.delete(normalized.id);
@@ -3414,7 +3898,7 @@ class FactorySupervisor {
   private async safeConfiguredScriptForWorktree(
     worktreePath: string,
     script: string,
-    placeholderLabel: "serve" | "healthcheck"
+    placeholderLabel: "build" | "serve" | "healthcheck"
   ): Promise<string> {
     if (!/^(npm|pnpm|yarn|bun)\s+run\b/i.test(script.trim())) {
       return script;
@@ -3432,6 +3916,11 @@ class FactorySupervisor {
     const detected = await detectPackageManagerAndScripts(worktreePath);
     const detectedServeScript =
       slot === "preview" ? detected.scripts.servePreview : detected.scripts.serveStable;
+    const configuredBuildScript = await this.safeConfiguredScriptForWorktree(
+      worktreePath,
+      this.config.scripts.build,
+      "build"
+    );
     const configuredServeScript = await this.safeConfiguredScriptForWorktree(
       worktreePath,
       this.configuredServeScriptForSlot(slot),
@@ -3444,7 +3933,7 @@ class FactorySupervisor {
     );
     return {
       worktreePath,
-      buildScript: resolveRuntimeScriptCommand(detected.scripts.build, this.config.scripts.build),
+      buildScript: resolveRuntimeScriptCommand(detected.scripts.build, configuredBuildScript),
       serveScript: resolveRuntimeScriptCommand(
         detectedServeScript,
         configuredServeScript
@@ -3616,25 +4105,29 @@ class FactorySupervisor {
       .map((match) => Number.parseInt(match[1] ?? "", 10))
       .filter((pid) => Number.isFinite(pid) && pid !== process.pid);
 
+    if (pids.length === 0) {
+      return;
+    }
+
+    const inventory = await this.listFactoryProcesses({ includeArgs: true, limit: 500 });
     for (const pid of new Set(pids)) {
-      try {
-        process.kill(pid, "SIGTERM");
-      } catch {
+      const record = inventory.find((processInfo) => processInfo.pid === pid);
+      if (!record) {
+        console.warn(`Refused to kill unknown listener pid ${pid} on managed port ${port}`);
         continue;
       }
 
-      await new Promise((resolve) => setTimeout(resolve, 250));
-      try {
-        process.kill(pid, 0);
-      } catch {
+      const targetPid = record.rootPid ?? record.pid;
+      const targetRecord = inventory.find((processInfo) => processInfo.pid === targetPid) ?? record;
+      const runtimeOwned = targetRecord.kind === "runtime" || targetRecord.ownerKind === "runtime";
+      if (!runtimeOwned && !targetRecord.killable) {
+        console.warn(
+          `Refused to kill listener pid ${pid} on managed port ${port}; kind=${targetRecord.kind} active=${targetRecord.active} stale=${targetRecord.stale} protected=${targetRecord.protected}`
+        );
         continue;
       }
 
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        // Ignore already-dead children.
-      }
+      await this.terminateProcessTree(targetPid);
     }
   }
 

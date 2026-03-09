@@ -63,6 +63,8 @@ export interface FactoryPaths {
   bootstrapScriptPath: string;
   lockPath: string;
   supervisorPidPath: string;
+  heartbeatPath: string;
+  lifecycleLogPath: string;
   managerToolTokenPath: string;
 }
 
@@ -100,8 +102,20 @@ export function getFactoryPaths(repoRoot: string): FactoryPaths {
     bootstrapScriptPath: path.join(factoryRoot, "scripts", "bootstrap-worktree.sh"),
     lockPath: path.join(factoryRoot, ".lock"),
     supervisorPidPath: path.join(factoryRoot, "factoryd.pid"),
+    heartbeatPath: path.join(factoryRoot, "factoryd.heartbeat.json"),
+    lifecycleLogPath: path.join(factoryRoot, "logs", "factoryd.lifecycle.log"),
     managerToolTokenPath: path.join(factoryRoot, "manager-tool.token")
   };
+}
+
+export function getFactorydUnitName(projectId: string, repoRoot: string): string {
+  const normalizedProjectId = projectId
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40) || "project";
+  const repoHash = createHash("sha1").update(path.resolve(repoRoot)).digest("hex").slice(0, 8);
+  return `permafactory-${normalizedProjectId}-${repoHash}.service`;
 }
 
 export async function ensureDir(dirPath: string): Promise<void> {

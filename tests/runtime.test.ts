@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import {
   allocatePorts,
   applyWorkerSandboxCapabilities,
@@ -11,6 +11,7 @@ import {
   currentCommit,
   deriveEffectivePortLeaseRequirement,
   formatHttpUrl,
+  getFactoryPaths,
   isLikelyGreenfieldRepoFiles,
   loadEnvFile,
   matchesTelegramSlashCommand,
@@ -26,6 +27,7 @@ import {
   upsertEnvFileValue,
   validateWithSchema
 } from "@permafactory/runtime";
+import { ensureProjectSpecAndConfig } from "@permafactory/config";
 import type { FactoryProjectConfig, ManagerTurnOutput, TaskContract } from "@permafactory/models";
 
 const config: FactoryProjectConfig = {
@@ -230,6 +232,12 @@ test("formatHttpUrl brackets IPv6 hosts", () => {
   assert.equal(formatHttpUrl("fd7a:115c:a1e0::ea01:583a", 3100), "http://[fd7a:115c:a1e0::ea01:583a]:3100");
 });
 
+test("getFactoryPaths exposes lifecycle log and heartbeat paths", () => {
+  const paths = getFactoryPaths("/tmp/demo");
+  assert.equal(paths.heartbeatPath, "/tmp/demo/.factory/factoryd.heartbeat.json");
+  assert.equal(paths.lifecycleLogPath, "/tmp/demo/.factory/logs/factoryd.lifecycle.log");
+});
+
 test("buildProjectSpecExcerpt preserves short specs and truncates long ones", () => {
   assert.equal(buildProjectSpecExcerpt("## Spec\nShip it\n", { maxChars: 100 }), "## Spec\nShip it");
 
@@ -321,6 +329,34 @@ test("updateGitBranchRef advances a branch ref to the deployed commit", async ()
   await updateGitBranchRef(repoRoot, "main", featureCommit);
 
   assert.equal(await currentCommit(repoRoot, "main"), featureCommit);
+});
+
+test("ensureProjectSpecAndConfig adds permafactory ignores to target repo gitignore", async () => {
+  const repoRoot = await mkdtemp(path.join(os.tmpdir(), "permafactory-init-"));
+
+  await writeFile(path.join(repoRoot, ".gitignore"), "node_modules/\n");
+
+  await ensureProjectSpecAndConfig({
+    repoRoot,
+    projectId: "demo",
+    defaultBranch: "main",
+    projectSpecPath: "spec.md"
+  });
+  await ensureProjectSpecAndConfig({
+    repoRoot,
+    projectId: "demo",
+    defaultBranch: "main",
+    projectSpecPath: "spec.md"
+  });
+
+  const gitignoreText = await readFile(path.join(repoRoot, ".gitignore"), "utf8");
+
+  assert.match(gitignoreText, /^node_modules\/\n\n# Permafactory\n/m);
+  assert.match(gitignoreText, /^\.factory\/$/m);
+  assert.match(gitignoreText, /^\.env\.factory$/m);
+  assert.match(gitignoreText, /^\.env\.factory\.example$/m);
+  assert.match(gitignoreText, /^\.factory\.env$/m);
+  assert.equal((gitignoreText.match(/# Permafactory/g) ?? []).length, 1);
 });
 
 test("manager output schema accepts a minimal valid payload", async () => {

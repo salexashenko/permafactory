@@ -30,6 +30,13 @@ export interface ScriptDetection {
 }
 
 const DEFAULT_CONFIG_FILE_NAME = "factory.config.ts";
+const PERMAFACTORY_GITIGNORE_HEADER = "# Permafactory";
+const PERMAFACTORY_GITIGNORE_RULES = [
+  ".factory/",
+  ".env.factory",
+  ".env.factory.example",
+  ".factory.env"
+] as const;
 
 export function getConfigPath(repoRoot: string): string {
   return path.join(repoRoot, DEFAULT_CONFIG_FILE_NAME);
@@ -351,6 +358,7 @@ export async function writeBootstrapArtifacts(
   const paths = getFactoryPaths(config.repoRoot);
   const envExample = renderEnvExample(config);
   await writeText(paths.configPath, renderFactoryConfig(config));
+  await ensureFactoryGitignore(config.repoRoot);
   await writeText(path.join(config.repoRoot, ".env.factory.example"), envExample);
   await writeTextIfAbsent(path.join(config.repoRoot, ".env.factory"), envExample);
   await writeTextIfAbsent(path.join(config.repoRoot, "AGENTS.md"), renderAgentsStub(projectId, config.projectSpecPath));
@@ -366,6 +374,35 @@ export async function writeBootstrapArtifacts(
   if (existing === LEGACY_ONBOARDING_PLACEHOLDER) {
     await writeText(onboardingPath, renderOnboardingSummary(config));
   }
+}
+
+async function ensureFactoryGitignore(repoRoot: string): Promise<void> {
+  const gitignorePath = path.join(repoRoot, ".gitignore");
+  const existing = (await fileExists(gitignorePath)) ? await readText(gitignorePath) : "";
+  const normalizedLines = new Set(
+    existing
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+  );
+  const linesToAppend: string[] = [];
+
+  if (!normalizedLines.has(PERMAFACTORY_GITIGNORE_HEADER)) {
+    linesToAppend.push(PERMAFACTORY_GITIGNORE_HEADER);
+  }
+
+  for (const rule of PERMAFACTORY_GITIGNORE_RULES) {
+    if (!normalizedLines.has(rule)) {
+      linesToAppend.push(rule);
+    }
+  }
+
+  if (linesToAppend.length === 0) {
+    return;
+  }
+
+  const separator = existing.length === 0 ? "" : existing.endsWith("\n") ? "\n" : "\n\n";
+  await writeText(gitignorePath, `${existing}${separator}${linesToAppend.join("\n")}\n`);
 }
 
 export async function detectLikelyDefaultBranch(repoRoot: string): Promise<string | undefined> {
