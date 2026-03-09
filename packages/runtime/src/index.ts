@@ -480,6 +480,10 @@ export async function addWorktree(
   baseRef: string
 ): Promise<void> {
   await ensureDir(path.dirname(worktreePath));
+  await runCommand("git", ["worktree", "prune", "--expire", "now"], {
+    cwd: repoRoot,
+    allowNonZeroExit: true
+  });
   await runCommand("git", ["worktree", "add", "-B", branchName, worktreePath, baseRef], {
     cwd: repoRoot
   });
@@ -496,6 +500,10 @@ export async function ensureDetachedWorktreeAtRef(
 ): Promise<void> {
   if (!(await fileExists(path.join(worktreePath, ".git")))) {
     await ensureDir(path.dirname(worktreePath));
+    await runCommand("git", ["worktree", "prune", "--expire", "now"], {
+      cwd: repoRoot,
+      allowNonZeroExit: true
+    });
     await runCommand("git", ["worktree", "add", "--detach", worktreePath, ref], {
       cwd: repoRoot
     });
@@ -513,6 +521,36 @@ export function slugify(value: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 48);
+}
+
+export function allocateFreshTaskId(requestedId: string, existingTaskIds: Iterable<string>): string {
+  const existing = new Set(existingTaskIds);
+  if (!existing.has(requestedId)) {
+    return requestedId;
+  }
+
+  let attempt = 2;
+  let candidate = `${requestedId}-r${attempt}`;
+  while (existing.has(candidate)) {
+    attempt += 1;
+    candidate = `${requestedId}-r${attempt}`;
+  }
+  return candidate;
+}
+
+export function selectTaskWorktreePath(
+  worktreesDir: string,
+  branchName: string,
+  options: {
+    existingWorktreePath?: string;
+    requestedWorktreePath?: string;
+  } = {}
+): string {
+  return (
+    options.existingWorktreePath ||
+    options.requestedWorktreePath ||
+    path.join(worktreesDir, slugify(branchName))
+  );
 }
 
 export function randomId(prefix: string): string {

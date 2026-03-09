@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import {
+  allocateFreshTaskId,
   allocatePorts,
   applyWorkerSandboxCapabilities,
   buildProjectSpecExcerpt,
@@ -22,6 +23,7 @@ import {
   runCommand,
   selectReachableHost,
   selectTaskCommitMessage,
+  selectTaskWorktreePath,
   shouldDeliverTelegramNotification,
   updateGitBranchRef,
   upsertEnvFileValue,
@@ -131,6 +133,35 @@ test("computeDecisionBudgetSnapshot preserves critical reserve", () => {
 test("allocatePorts can allocate app-only leases", () => {
   const ports = allocatePorts(config, new Set([3200, 3201, 4200]), { app: true, e2e: false });
   assert.deepEqual(ports, { app: 3202 });
+});
+
+test("allocateFreshTaskId preserves unused ids and increments reused ids", () => {
+  assert.equal(allocateFreshTaskId("task-alpha", []), "task-alpha");
+  assert.equal(allocateFreshTaskId("task-alpha", ["task-alpha"]), "task-alpha-r2");
+  assert.equal(
+    allocateFreshTaskId("task-alpha", ["task-alpha", "task-alpha-r2", "task-alpha-r3"]),
+    "task-alpha-r4"
+  );
+});
+
+test("selectTaskWorktreePath prefers the branch lane path over a new requested path", () => {
+  assert.equal(
+    selectTaskWorktreePath("/tmp/worktrees", "task/clean-phone-shell", {
+      existingWorktreePath: "/tmp/worktrees/task-clean-phone-shell",
+      requestedWorktreePath: "/tmp/worktrees/task-clean-phone-shell-retry"
+    }),
+    "/tmp/worktrees/task-clean-phone-shell"
+  );
+  assert.equal(
+    selectTaskWorktreePath("/tmp/worktrees", "task/clean-phone-shell", {
+      requestedWorktreePath: "/tmp/worktrees/task-clean-phone-shell-retry"
+    }),
+    "/tmp/worktrees/task-clean-phone-shell-retry"
+  );
+  assert.equal(
+    selectTaskWorktreePath("/tmp/worktrees", "task/clean-phone-shell"),
+    "/tmp/worktrees/task-clean-phone-shell"
+  );
 });
 
 test("deriveEffectivePortLeaseRequirement suppresses worker ports when sandbox cannot bind", () => {

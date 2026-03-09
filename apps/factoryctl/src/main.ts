@@ -8,6 +8,7 @@ import { ensureProjectSpecAndConfig, getConfigPath, loadProjectConfig, renderFac
 import {
   branchExists,
   currentCommit,
+  ensureDir,
   ensureBranchFrom,
   fileExists,
   getFactorydUnitName,
@@ -565,6 +566,15 @@ async function handleStart(args: string[]): Promise<void> {
       console.log(`factoryd is already running for ${repoRoot} (${unitName})`);
       return;
     }
+
+    await runCommand("systemctl", ["--user", "stop", unitName], {
+      cwd: factoryRepoRoot,
+      allowNonZeroExit: true
+    }).catch(() => undefined);
+    await runCommand("systemctl", ["--user", "reset-failed", unitName], {
+      cwd: factoryRepoRoot,
+      allowNonZeroExit: true
+    }).catch(() => undefined);
   }
   if (existingPid && Number.isFinite(existingPid)) {
     try {
@@ -579,6 +589,7 @@ async function handleStart(args: string[]): Promise<void> {
   const stdoutPath = path.join(paths.logsDir, "factoryd.out.log");
   const stderrPath = path.join(paths.logsDir, "factoryd.err.log");
   const signalTracePrefix = path.join(paths.logsDir, "factoryd.signal-trace");
+  await ensureDir(paths.logsDir);
 
   if (systemdRunAvailable) {
     const directExec = `exec ${shellEscape(process.execPath)} ${commandArgs.map(shellEscape).join(" ")} >>${shellEscape(stdoutPath)} 2>>${shellEscape(stderrPath)}`;

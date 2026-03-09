@@ -37,6 +37,7 @@ import type {
 } from "@permafactory/models";
 import {
   addWorktree,
+  allocateFreshTaskId,
   allocatePorts,
   applyWorkerSandboxCapabilities,
   buildProjectSpecExcerpt,
@@ -62,6 +63,7 @@ import {
   runCommand,
   sampleResources,
   selectTaskCommitMessage,
+  selectTaskWorktreePath,
   sendTelegramApiRequest,
   shouldDeliverTelegramNotification,
   slugify,
@@ -704,6 +706,9 @@ class FactorySupervisor {
   async run(once: boolean): Promise<void> {
     this.stopRequested = false;
     this.shuttingDown = false;
+    this.activeManagerThreadId = undefined;
+    this.activeManagerTurnId = undefined;
+    this.managerThreadNeedsRotation = true;
     await ensureDir(this.paths.logsDir);
     await ensureDir(this.paths.tasksDir);
     await ensureDir(this.paths.worktreesDir);
@@ -2408,13 +2413,13 @@ class FactorySupervisor {
       }
       case "start_task": {
         const contract = args as unknown as TaskContract;
-        await this.materializeAndStartTask(contract);
-        const task = this.db.getTask(contract.id);
+        const normalized = await this.materializeAndStartTask(contract);
+        const task = this.db.getTask(normalized.id);
         return {
-          taskId: contract.id,
+          taskId: normalized.id,
           status: task?.status ?? "queued",
-          branchName: contract.branchName,
-          worktreePath: contract.worktreePath
+          branchName: normalized.branchName,
+          worktreePath: normalized.worktreePath
         };
       }
       case "cancel_task": {
@@ -2799,16 +2804,8 @@ class FactorySupervisor {
     this.db.insertTaskEvent(taskId, "cancelled", "Task cancelled by manager");
   }
 
-  private async materializeAndStartTask(contract: TaskContract): Promise<void> {
-    const branchName = contract.branchName || `agent/${slugify(contract.id)}`;
-    const worktreePath = contract.worktreePath || path.join(this.paths.worktreesDir, contract.id);
-    const normalized: TaskContract = {
-      ...contract,
-      branchName,
-      worktreePath,
-      baseBranch: contract.baseBranch || this.config.candidateBranch,
-      ports: contract.ports ?? {}
-    };
+  private async materializeAndStartTask(contract: TaskContract): Promise<TaskContract> {
+    const normalized = this.normalizeTaskStartContract(contract);
     const openDecisionIds = new Set(
       this.db.listOpenDecisions(this.config.projectId).map((decision) => decision.id)
     );
@@ -2819,6 +2816,19 @@ class FactorySupervisor {
 
     if (this.config.bootstrap.status === "waiting_for_first_task") {
       await this.persistBootstrapStatus("baselining_repo");
+    }
+
+    const conflictingAgent = this.db.listAgents(this.config.projectId).find(
+      (agent) =>
+        agent.role !== "manager" &&
+        agent.status === "running" &&
+        agent.taskId !== normalized.id &&
+        (agent.branch === normalized.branchName || agent.worktreePath === normalized.worktreePath)
+    );
+    if (conflictingAgent) {
+      throw new Error(
+        `Branch lane ${normalized.branchName} is already active under ${conflictingAgent.taskId ?? conflictingAgent.id}`
+      );
     }
 
     this.db.upsertTask({
@@ -2835,6 +2845,7 @@ class FactorySupervisor {
       contract: normalized,
       blockedByDecisionIds: unresolvedBlockingDecisions
     });
+    this.supersedeDormantLaneTasks(normalized.id, normalized.branchName, normalized.worktreePath);
 
     if (unresolvedBlockingDecisions.length > 0) {
       this.db.insertTaskEvent(
@@ -2842,21 +2853,22 @@ class FactorySupervisor {
         "blocked",
         `Task blocked pending decision(s): ${unresolvedBlockingDecisions.join(", ")}`
       );
-      return;
+      return normalized;
     }
 
     if (this.stopRequested) {
-      return;
+      return normalized;
     }
 
     const runningWorkers = this.db
       .listAgents(this.config.projectId)
       .filter((agent) => agent.role !== "manager" && agent.status === "running").length;
     if (runningWorkers >= this.config.scheduler.maxWorkers) {
-      return;
+      return normalized;
     }
 
     await this.startWorker(normalized, normalized.kind === "test" ? "test" : "code");
+    return normalized;
   }
 
   private async ensureInjectedWorktreeFiles(worktreePath: string): Promise<void> {
@@ -2910,6 +2922,64 @@ class FactorySupervisor {
 
   private findTaskByBranch(branchName: string): ReturnType<FactoryDatabase["getTask"]> {
     return this.db.listTasks(this.config.projectId).find((task) => task.branchName === branchName);
+  }
+
+  private listTasksForBranch(branchName: string): ReturnType<FactoryDatabase["listTasks"]> {
+    return this.db
+      .listTasks(this.config.projectId)
+      .filter((task) => task.branchName === branchName)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  private normalizeTaskStartContract(contract: TaskContract): TaskContract {
+    const branchName = contract.branchName || `agent/${slugify(contract.id)}`;
+    const existingBranchTasks = this.listTasksForBranch(branchName);
+    const existingWorktreePath = existingBranchTasks.find((task) => task.worktreePath)?.worktreePath;
+    const existingTaskIds = this.db.listTasks(this.config.projectId).map((task) => task.id);
+    const freshTaskId = allocateFreshTaskId(contract.id, existingTaskIds);
+
+    return {
+      ...contract,
+      id: freshTaskId,
+      branchName,
+      worktreePath: selectTaskWorktreePath(this.paths.worktreesDir, branchName, {
+        existingWorktreePath,
+        requestedWorktreePath: contract.worktreePath
+      }),
+      baseBranch: contract.baseBranch || existingBranchTasks[0]?.baseBranch || this.config.candidateBranch,
+      ports: contract.ports ?? {},
+      context: {
+        ...contract.context,
+        relatedTaskIds: Array.from(
+          new Set([...contract.context.relatedTaskIds, ...existingBranchTasks.map((task) => task.id)])
+        )
+      }
+    };
+  }
+
+  private supersedeDormantLaneTasks(taskId: string, branchName: string, worktreePath: string): void {
+    const runningTaskIds = new Set(
+      this.db
+        .listAgents(this.config.projectId)
+        .filter((agent) => agent.role !== "manager" && agent.status === "running" && agent.taskId)
+        .map((agent) => agent.taskId as string)
+    );
+    for (const task of this.db.listTasks(this.config.projectId)) {
+      if (task.id === taskId) {
+        continue;
+      }
+      if (!["queued", "running", "blocked", "review"].includes(task.status)) {
+        continue;
+      }
+      if (runningTaskIds.has(task.id)) {
+        continue;
+      }
+      if (task.branchName !== branchName && task.worktreePath !== worktreePath) {
+        continue;
+      }
+      this.db.updateTaskStatus(task.id, "cancelled");
+      this.db.insertTaskEvent(task.id, "cancelled", `Superseded by ${taskId} on ${branchName}`);
+    }
   }
 
   private async startReviewRequest(review: ReviewRequest): Promise<void> {
@@ -3041,35 +3111,32 @@ class FactorySupervisor {
     const task =
       (integration.taskId ? this.db.getTask(integration.taskId) : undefined) ??
       (integration.branch ? this.findTaskByBranch(integration.branch) : undefined);
-    if (!task?.contract || !task.branchName || !task.worktreePath) {
+    const branchName = integration.branch ?? task?.branchName;
+    const worktreePath = integration.worktreePath ?? task?.worktreePath;
+    const mergeTarget = integration.targetBranch ?? task?.baseBranch ?? task?.contract?.baseBranch;
+    if (!mergeTarget) {
       throw new Error(
-        `Cannot integrate unknown branch target ${integration.taskId ?? integration.branch ?? "unknown"}`
+        `Cannot integrate ${integration.taskId ?? integration.branch ?? integration.commit ?? "unknown"} without a target branch`
       );
     }
 
-    const mergeTarget = integration.targetBranch ?? task.baseBranch ?? task.contract.baseBranch;
-    if (!mergeTarget) {
-      throw new Error(`Task ${task.id} has no merge target`);
-    }
-
-    if (integration.commit) {
-      const currentBranchHead = await currentCommit(this.config.repoRoot, task.branchName).catch(() => undefined);
-      if (!currentBranchHead || currentBranchHead !== integration.commit) {
-        throw new Error(
-          `Integration request for ${task.branchName} expected ${integration.commit.slice(0, 12)} but found ${currentBranchHead?.slice(0, 12) ?? "missing"}`
-        );
-      }
-    }
-
     const committedBranchHead =
-      (await this.commitTaskWorktree(task.contract, undefined, integration.reason)) ??
-      (await currentCommit(this.config.repoRoot, task.branchName));
+      integration.commit ||
+      (task?.contract && worktreePath
+        ? (await this.commitTaskWorktree(task.contract, undefined, integration.reason))
+        : undefined) ||
+      (branchName ? await currentCommit(this.config.repoRoot, branchName).catch(() => undefined) : undefined);
+    if (!committedBranchHead) {
+      throw new Error(
+        `Cannot resolve an integration commit for ${integration.taskId ?? integration.branch ?? "unknown"}`
+      );
+    }
     const targetHead = await currentCommit(this.config.repoRoot, mergeTarget);
-    const mergeBase = await runCommand("git", ["merge-base", mergeTarget, task.branchName], {
+    const mergeBase = await runCommand("git", ["merge-base", mergeTarget, committedBranchHead], {
       cwd: this.config.repoRoot
     });
     if (mergeBase.stdout.trim() !== targetHead) {
-      throw new Error(`Cannot fast-forward ${mergeTarget} to ${task.branchName}`);
+      throw new Error(`Cannot fast-forward ${mergeTarget} to ${committedBranchHead.slice(0, 12)}`);
     }
 
     await runCommand(
@@ -3077,14 +3144,18 @@ class FactorySupervisor {
       ["update-ref", `refs/heads/${mergeTarget}`, committedBranchHead],
       { cwd: this.config.repoRoot }
     );
-    await this.refreshDetectedScriptsFromWorktree(task.worktreePath);
+    if (worktreePath && (await fileExists(path.join(worktreePath, ".git")))) {
+      await this.refreshDetectedScriptsFromWorktree(worktreePath);
+    }
     await this.refreshProjectState();
-    this.db.insertTaskEvent(
-      task.id,
-      "integrated",
-      `Integrated ${task.branchName} into ${mergeTarget} at ${committedBranchHead.slice(0, 12)}: ${integration.reason}`,
-      { targetBranch: mergeTarget, commit: committedBranchHead }
-    );
+    if (task) {
+      this.db.insertTaskEvent(
+        task.id,
+        "integrated",
+        `Integrated ${(branchName ?? task.id)} into ${mergeTarget} at ${committedBranchHead.slice(0, 12)}: ${integration.reason}`,
+        { targetBranch: mergeTarget, commit: committedBranchHead }
+      );
+    }
     this.pendingManagerWakeReasons.add("branch_integrated");
   }
 
@@ -3785,6 +3856,7 @@ class FactorySupervisor {
         existing.script === scripts.serveScript &&
         existing.healthcheckScript === scripts.healthcheckScript
       ) {
+        await this.reapRuntimeSlotProcesses(slot, existing.child.pid ?? undefined);
         try {
           await this.runRuntimeHealthcheck(worktreePath, port, scripts.healthcheckScript);
           return {
@@ -3801,6 +3873,7 @@ class FactorySupervisor {
     }
 
     await this.stopRuntimeProcess(slot);
+    await this.reapRuntimeSlotProcesses(slot);
     await this.stopOrphanRuntimeListeners(port);
     const scripts = await this.prepareRuntimeWorktree(slot, commit, port);
     const deployIdentity = await this.buildRuntimeDeployIdentity(slot, commit, port);
@@ -3857,6 +3930,7 @@ class FactorySupervisor {
   private async stopRuntimeProcess(slot: RuntimeSlotName): Promise<void> {
     const existing = this.runtimeProcesses.get(slot);
     if (!existing) {
+      await this.reapRuntimeSlotProcesses(slot);
       return;
     }
 
@@ -3875,6 +3949,7 @@ class FactorySupervisor {
         // Ignore already-dead children.
       }
     }
+    await this.reapRuntimeSlotProcesses(slot);
   }
 
   private runtimeSlotWorktreePath(slot: RuntimeSlotName): string {
@@ -4128,6 +4203,37 @@ class FactorySupervisor {
       }
 
       await this.terminateProcessTree(targetPid);
+    }
+  }
+
+  private async reapRuntimeSlotProcesses(
+    slot: RuntimeSlotName,
+    keepRootPid?: number
+  ): Promise<void> {
+    const inventory = await this.listFactoryProcesses({ includeArgs: true, limit: 500 });
+    const roots = new Set<number>();
+    for (const processInfo of inventory) {
+      const slotMatch =
+        processInfo.ownerKind === "runtime" && processInfo.ownerId === slot
+          ? true
+          : this.inferRuntimeSlotFromPath(processInfo.cwd) === slot ||
+            this.inferRuntimeSlotFromPath(processInfo.rootCwd) === slot;
+      if (!slotMatch) {
+        continue;
+      }
+      const rootPid = processInfo.rootPid ?? processInfo.pid;
+      if (keepRootPid !== undefined && rootPid === keepRootPid) {
+        continue;
+      }
+      if (rootPid === process.pid) {
+        continue;
+      }
+      roots.add(rootPid);
+    }
+
+    for (const rootPid of roots) {
+      await this.terminateProcessTree(rootPid);
+      console.warn(`Reaped extra runtime process tree for ${slot} rooted at pid ${rootPid}`);
     }
   }
 
