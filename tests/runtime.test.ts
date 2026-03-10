@@ -8,14 +8,18 @@ import {
   allocatePorts,
   applyWorkerSandboxCapabilities,
   buildProjectSpecExcerpt,
+  compressRecentManagerTurns,
+  computeNoActiveWorkWakeCooldownMs,
   computeDecisionBudgetSnapshot,
   currentCommit,
   deriveEffectivePortLeaseRequirement,
   formatHttpUrl,
   getFactoryPaths,
+  isManagerTurnNoOp,
   isLikelyGreenfieldRepoFiles,
   loadEnvFile,
   matchesTelegramSlashCommand,
+  normalizeManagerLoopSummary,
   normalizeManagerTurnOutput,
   parseTopLevelBacklogItems,
   readEnvFileValues,
@@ -80,7 +84,6 @@ const config: FactoryProjectConfig = {
     stableProxy: 3000,
     stableA: 3001,
     stableB: 3002,
-    preview: 3100,
     dashboard: 8787,
     appServer: 7781,
     workerStart: 3200,
@@ -96,7 +99,6 @@ const config: FactoryProjectConfig = {
     build: "npm run build",
     smoke: "npm run smoke",
     serveStable: "npm run start",
-    servePreview: "npm run preview",
     serveWorker: "npm run dev",
     e2e: "npm run e2e",
     healthcheck: "npm run healthcheck"
@@ -164,11 +166,131 @@ test("selectTaskWorktreePath prefers the branch lane path over a new requested p
   );
 });
 
+test("compressRecentManagerTurns collapses repeated no-op loop turns", () => {
+  const turns = [
+    {
+      at: "2026-03-09T18:28:46.695Z",
+      summary: "No safe manager action changed this turn because routing is still unreliable.",
+      wakeReasons: ["no_active_work"],
+      actionCounts: {
+        tasksToStart: 0,
+        tasksToCancel: 0,
+        reviewsToStart: 0,
+        integrations: 0,
+        deployments: 0,
+        decisions: 0,
+        userMessages: 0
+      },
+      actionPreview: {
+        tasksToStart: [],
+        tasksToCancel: [],
+        reviewsToStart: [],
+        integrations: [],
+        deployments: [],
+        decisions: [],
+        userMessages: []
+      },
+      mismatchHints: [],
+      toolCalls: []
+    },
+    {
+      at: "2026-03-09T18:27:28.270Z",
+      summary: "No safe manager action changed this turn because routing is still unreliable.",
+      wakeReasons: ["no_active_work"],
+      actionCounts: {
+        tasksToStart: 0,
+        tasksToCancel: 0,
+        reviewsToStart: 0,
+        integrations: 0,
+        deployments: 0,
+        decisions: 0,
+        userMessages: 0
+      },
+      actionPreview: {
+        tasksToStart: [],
+        tasksToCancel: [],
+        reviewsToStart: [],
+        integrations: [],
+        deployments: [],
+        decisions: [],
+        userMessages: []
+      },
+      mismatchHints: [],
+      toolCalls: []
+    },
+    {
+      at: "2026-03-09T18:23:58.695Z",
+      summary: "Started review on task/foo against candidate.",
+      wakeReasons: ["worker_terminal"],
+      actionCounts: {
+        tasksToStart: 0,
+        tasksToCancel: 0,
+        reviewsToStart: 1,
+        integrations: 0,
+        deployments: 0,
+        decisions: 0,
+        userMessages: 0
+      },
+      actionPreview: {
+        tasksToStart: [],
+        tasksToCancel: [],
+        reviewsToStart: ["task/foo->candidate"],
+        integrations: [],
+        deployments: [],
+        decisions: [],
+        userMessages: []
+      },
+      mismatchHints: [],
+      toolCalls: ["completed:start_review:task/foo->candidate"]
+    }
+  ];
+
+  const compressed = compressRecentManagerTurns(turns);
+  assert.equal(compressed.length, 2);
+  assert.equal(compressed[0]?.at, "2026-03-09T18:28:46.695Z");
+  assert.equal(compressed[1]?.at, "2026-03-09T18:23:58.695Z");
+});
+
+test("computeNoActiveWorkWakeCooldownMs backs off repeated no-op continuity wakes", () => {
+  const repeatedNoOps = Array.from({ length: 4 }, (_, index) => ({
+    at: `2026-03-09T18:2${index}:00.000Z`,
+    summary: "No safe manager action changed this turn because routing is still unreliable.",
+    wakeReasons: ["no_active_work"],
+    actionCounts: {
+      tasksToStart: 0,
+      tasksToCancel: 0,
+      reviewsToStart: 0,
+      integrations: 0,
+      deployments: 0,
+      decisions: 0,
+      userMessages: 0
+    },
+    actionPreview: {
+      tasksToStart: [],
+      tasksToCancel: [],
+      reviewsToStart: [],
+      integrations: [],
+      deployments: [],
+      decisions: [],
+      userMessages: []
+    },
+    mismatchHints: [],
+    toolCalls: []
+  }));
+
+  assert.equal(isManagerTurnNoOp(repeatedNoOps[0]!), true);
+  assert.equal(
+    normalizeManagerLoopSummary("No safe manager action changed this turn because routing is still unreliable."),
+    normalizeManagerLoopSummary("No safe manager action changed this turn because routing is still unreliable.")
+  );
+  assert.equal(computeNoActiveWorkWakeCooldownMs(repeatedNoOps, 60_000), 15 * 60_000);
+});
+
 test("deriveEffectivePortLeaseRequirement suppresses worker ports when sandbox cannot bind", () => {
   const requirement = deriveEffectivePortLeaseRequirement(
     {
       kind: "code",
-      needsPreview: true,
+      needsAppRuntime: true,
       constraints: {
         mustRunChecks: ["npm run preview", "npm run smoke"]
       }
@@ -185,14 +307,14 @@ test("applyWorkerSandboxCapabilities clears unusable worker ports and records th
   const contract: TaskContract = {
     id: "task_demo",
     kind: "code",
-    title: "Bootstrap preview",
-    goal: "Bootstrap preview",
-    acceptanceCriteria: ["Preview command exists"],
+    title: "Bootstrap runtime",
+    goal: "Bootstrap runtime",
+    acceptanceCriteria: ["Runtime command exists"],
     baseBranch: "candidate",
-    branchName: "task/bootstrap-preview",
+    branchName: "task/bootstrap-runtime",
     worktreePath: "/tmp/demo/.factory/worktrees/task_demo",
     lockScope: ["repo"],
-    needsPreview: true,
+    needsAppRuntime: true,
     ports: {
       app: 3200,
       e2e: 4200
@@ -205,7 +327,7 @@ test("applyWorkerSandboxCapabilities clears unusable worker ports and records th
       mustRunChecks: ["npm run preview"]
     },
     context: {
-      userIntent: "Bootstrap preview",
+      userIntent: "Bootstrap runtime",
       relatedTaskIds: [],
       blockingDecisions: []
     }
@@ -278,7 +400,7 @@ test("buildProjectSpecExcerpt preserves short specs and truncates long ones", ()
   assert.match(excerpt, /\[project spec excerpt truncated\]$/);
 });
 
-test("shouldDeliverTelegramNotification only allows direct replies, decisions, ships, and digests", () => {
+test("shouldDeliverTelegramNotification allows direct replies, decisions, ships, incidents, and digests", () => {
   assert.equal(shouldDeliverTelegramNotification("decision_required"), true);
   assert.equal(shouldDeliverTelegramNotification("ship_result"), true);
   assert.equal(shouldDeliverTelegramNotification("daily_digest"), true);
@@ -287,7 +409,7 @@ test("shouldDeliverTelegramNotification only allows direct replies, decisions, s
     shouldDeliverTelegramNotification("info_update", { isDirectUserResponse: true }),
     true
   );
-  assert.equal(shouldDeliverTelegramNotification("incident_alert"), false);
+  assert.equal(shouldDeliverTelegramNotification("incident_alert"), true);
 });
 
 test("matchesTelegramSlashCommand accepts bot-targeted commands with optional payload", () => {

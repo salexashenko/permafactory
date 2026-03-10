@@ -1234,7 +1234,7 @@ export class FactoryDatabase {
 
   recordDeployment(options: {
     projectId: string;
-    target: "stable" | "preview";
+    target: "stable";
     status: string;
     url: string;
     commit: string;
@@ -1259,10 +1259,10 @@ export class FactoryDatabase {
 
   listDeployments(
     projectId: string,
-    target?: "stable" | "preview",
+    target?: "stable",
     limit = 20
   ): Array<{
-    target: "stable" | "preview";
+    target: "stable";
     status: string;
     url: string;
     commit: string;
@@ -1295,7 +1295,7 @@ export class FactoryDatabase {
           .all(projectId, limit) as Record<string, unknown>[]);
 
     return rows.map((row) => ({
-      target: row.target as "stable" | "preview",
+      target: row.target as "stable",
       status: String(row.status),
       url: String(row.url),
       commit: String(row.commit_sha),
@@ -1320,12 +1320,6 @@ export class FactoryDatabase {
         "SELECT status, url, commit_sha, active_slot, reason, created_at FROM deployments WHERE project_id = ? AND target = 'stable' ORDER BY created_at DESC LIMIT 1"
       )
       .get(projectId) as Record<string, unknown> | undefined;
-    const preview = this.db
-      .prepare(
-        "SELECT status, url, commit_sha, reason, created_at FROM deployments WHERE project_id = ? AND target = 'preview' ORDER BY created_at DESC LIMIT 1"
-      )
-      .get(projectId) as Record<string, unknown> | undefined;
-
     return {
       stable: {
         status: (stable?.status as ManagerTurnInput["deployments"]["stable"]["status"]) ?? "degraded",
@@ -1342,17 +1336,6 @@ export class FactoryDatabase {
         updatedAt: typeof stable?.created_at === "string" ? stable.created_at : undefined,
         canRollback: Boolean(rollbackTarget),
         rollbackTargetCommit: rollbackTarget
-      },
-      preview: {
-        status: (preview?.status as ManagerTurnInput["deployments"]["preview"]["status"]) ?? "down",
-        url: typeof preview?.url === "string" ? preview.url : "http://127.0.0.1:3100",
-        commit: typeof preview?.commit_sha === "string" ? preview.commit_sha : "",
-        branch:
-          typeof preview?.commit_sha === "string" && preview.commit_sha === project.candidateCommit
-            ? project.candidateBranch
-            : undefined,
-        reason: typeof preview?.reason === "string" ? preview.reason : undefined,
-        updatedAt: typeof preview?.created_at === "string" ? preview.created_at : undefined
       }
     };
   }

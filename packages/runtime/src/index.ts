@@ -24,6 +24,7 @@ import type {
   DecisionBudgetSnapshot,
   DeploymentIntent,
   FactoryProjectConfig,
+  ManagerTurnInput,
   ManagerTurnOutput,
   PortLeaseRequirement,
   ReasoningEffort,
@@ -561,6 +562,86 @@ export function nowIso(): string {
   return new Date().toISOString();
 }
 
+export function isManagerTurnNoOp(turn: ManagerTurnInput["recentManagerTurns"][number]): boolean {
+  const totalActions =
+    turn.actionCounts.tasksToStart +
+    turn.actionCounts.tasksToCancel +
+    turn.actionCounts.reviewsToStart +
+    turn.actionCounts.integrations +
+    turn.actionCounts.deployments +
+    turn.actionCounts.decisions +
+    turn.actionCounts.userMessages;
+  return totalActions === 0 && turn.toolCalls.length === 0;
+}
+
+export function normalizeManagerLoopSummary(summary: string): string {
+  return summary
+    .replace(/`[^`]+`/g, "`ref`")
+    .replace(/\b[0-9a-f]{8,40}\b/gi, "sha")
+    .replace(/\d+/g, "n")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+export function compressRecentManagerTurns(
+  turns: ManagerTurnInput["recentManagerTurns"],
+  options: { maxTurns?: number } = {}
+): ManagerTurnInput["recentManagerTurns"] {
+  const maxTurns = Math.max(1, options.maxTurns ?? 8);
+  const compressed: ManagerTurnInput["recentManagerTurns"] = [];
+
+  for (const turn of turns) {
+    const last = compressed[compressed.length - 1];
+    const duplicateNoOpLoop =
+      last &&
+      isManagerTurnNoOp(turn) &&
+      isManagerTurnNoOp(last) &&
+      normalizeManagerLoopSummary(turn.summary) === normalizeManagerLoopSummary(last.summary);
+    if (duplicateNoOpLoop) {
+      continue;
+    }
+    compressed.push(turn);
+    if (compressed.length >= maxTurns) {
+      break;
+    }
+  }
+
+  return compressed;
+}
+
+export function computeNoActiveWorkWakeCooldownMs(
+  turns: ManagerTurnInput["recentManagerTurns"],
+  defaultCooldownMs: number
+): number {
+  const baseCooldownMs = Math.max(defaultCooldownMs, 60_000);
+  let idleNoOpStreak = 0;
+
+  for (const turn of turns) {
+    if (!isManagerTurnNoOp(turn)) {
+      break;
+    }
+    const idleWakeOnly =
+      turn.wakeReasons.length > 0 &&
+      turn.wakeReasons.every((reason) => reason === "no_active_work" || reason === "manager_thread_rotation");
+    if (!idleWakeOnly) {
+      break;
+    }
+    idleNoOpStreak += 1;
+  }
+
+  if (idleNoOpStreak >= 8) {
+    return Math.max(baseCooldownMs, 60 * 60_000);
+  }
+  if (idleNoOpStreak >= 4) {
+    return Math.max(baseCooldownMs, 15 * 60_000);
+  }
+  if (idleNoOpStreak >= 2) {
+    return Math.max(baseCooldownMs, 5 * 60_000);
+  }
+  return baseCooldownMs;
+}
+
 function normalizeHost(value: string | undefined): string | undefined {
   const normalized = value?.trim().replace(/\.$/, "");
   return normalized && normalized.length > 0 ? normalized : undefined;
@@ -594,7 +675,12 @@ export function shouldDeliverTelegramNotification(
   kind: string,
   options: { isDirectUserResponse?: boolean } = {}
 ): boolean {
-  if (kind === "decision_required" || kind === "ship_result" || kind === "daily_digest") {
+  if (
+    kind === "decision_required" ||
+    kind === "ship_result" ||
+    kind === "daily_digest" ||
+    kind === "incident_alert"
+  ) {
     return true;
   }
 
@@ -778,10 +864,6 @@ function normalizeReasoningEffort(value: unknown, title: string, goal: string): 
 
 function normalizeDeploymentKind(value: unknown): DeploymentIntent["kind"] | undefined {
   switch (firstString(value)?.toLowerCase()) {
-    case "deploy_preview":
-    case "preview":
-    case "deploy-preview":
-      return "deploy_preview";
     case "promote_candidate":
     case "promote":
     case "ship":
@@ -811,7 +893,12 @@ function normalizeDecisionPriority(value: unknown): DecisionRequest["priority"] 
   }
 }
 
-function inferNeedsPreview(kind: TaskContract["kind"], title: string, goal: string, checks: string[]): boolean {
+function inferNeedsAppRuntime(
+  kind: TaskContract["kind"],
+  title: string,
+  goal: string,
+  checks: string[]
+): boolean {
   if (checks.some((check) => /(serve|preview|smoke|browser|playwright|cypress|dev|start)/i.test(check))) {
     return true;
   }
@@ -908,13 +995,15 @@ export function computeDecisionBudgetSnapshot(
   };
 }
 
-export function derivePortLeaseRequirement(task: Pick<TaskContract, "kind" | "needsPreview" | "constraints">): PortLeaseRequirement {
+export function derivePortLeaseRequirement(
+  task: Pick<TaskContract, "kind" | "needsAppRuntime" | "constraints">
+): PortLeaseRequirement {
   const mustRunChecks = task.constraints.mustRunChecks.map((check) => check.toLowerCase());
   const needsE2e = mustRunChecks.some((check) =>
     ["e2e", "playwright", "cypress", "browser"].some((needle) => check.includes(needle))
   );
   const needsApp =
-    task.needsPreview ||
+    task.needsAppRuntime ||
     needsE2e ||
     task.kind === "code" ||
     mustRunChecks.some((check) =>
@@ -928,7 +1017,7 @@ export function derivePortLeaseRequirement(task: Pick<TaskContract, "kind" | "ne
 }
 
 export function deriveEffectivePortLeaseRequirement(
-  task: Pick<TaskContract, "kind" | "needsPreview" | "constraints">,
+  task: Pick<TaskContract, "kind" | "needsAppRuntime" | "constraints">,
   capabilities: WorkerSandboxCapabilities
 ): PortLeaseRequirement {
   if (!capabilities.canBindListenSockets) {

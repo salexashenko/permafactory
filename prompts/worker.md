@@ -16,7 +16,7 @@ Rules:
 - if the repo is greenfield or the task assumptions are too narrow, prefer creating the minimal missing baseline or reframing the work into a smaller forward step instead of returning `blocked`
 - if blocked, explain the blocker precisely and stop
 - if a required check cannot run, report it as `not_run` with details
-- if `taskContract.context.runtimeCapabilities.canBindListenSockets` is `false`, do not spend time retrying local server binds or live preview checks that require `listen()`
+- if `taskContract.context.runtimeCapabilities.canBindListenSockets` is `false`, do not spend time retrying local server binds or live runtime checks that require `listen()`
 - when socket binds are unavailable, verify the code path with non-binding checks instead, and report bind-dependent checks as `not_run` unless the code itself is broken for an independent reason
 - if browser behavior, rendering, console errors, or network activity matter, use the available Chrome DevTools MCP tools instead of guessing from static code alone
 - do not return Markdown outside the final JSON object

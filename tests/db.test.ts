@@ -55,7 +55,6 @@ function makeConfig(repoRoot: string): FactoryProjectConfig {
       stableProxy: 3000,
       stableA: 3001,
       stableB: 3002,
-      preview: 3100,
       dashboard: 8787,
       appServer: 7781,
       workerStart: 3200,
@@ -71,7 +70,6 @@ function makeConfig(repoRoot: string): FactoryProjectConfig {
       build: "npm run build",
       smoke: "npm run smoke",
       serveStable: "npm run start",
-      servePreview: "npm run preview",
       serveWorker: "npm run dev",
       e2e: "npm run e2e",
       healthcheck: "npm run healthcheck"
@@ -116,7 +114,7 @@ function makeTask(id: string, blockingDecisions: string[]): TaskContract {
     branchName: `agent/${id}`,
     worktreePath: `/tmp/${id}`,
     lockScope: [],
-    needsPreview: false,
+    needsAppRuntime: false,
     ports: {},
     runtime: {
       maxRuntimeMinutes: 15,
@@ -292,9 +290,9 @@ test("getManagerInput exposes structured latest task facts and deployment reason
     });
     db.recordDeployment({
       projectId: config.projectId,
-      target: "preview",
+      target: "stable",
       status: "down",
-      url: "http://127.0.0.1:3100",
+      url: "http://127.0.0.1:3000",
       commit: "abc123",
       reason: "Healthcheck failed"
     });
@@ -305,8 +303,8 @@ test("getManagerInput exposes structured latest task facts and deployment reason
     assert.deepEqual(task?.relatedTaskIds, ["parent-task"]);
     assert.equal(task?.latestEventType, "completed");
     assert.equal(task?.latestEventPayload?.recommendedAction, "merge");
-    assert.equal(input.deployments.preview.reason, "Healthcheck failed");
-    assert.equal(input.deployments.preview.commit, "abc123");
+    assert.equal(input.deployments.stable.reason, "Healthcheck failed");
+    assert.equal(input.deployments.stable.commit, "abc123");
   });
 });
 
@@ -468,22 +466,12 @@ test("deployment snapshots expose branch identity and latest task events are que
       activeSlot: "stable-b",
       reason: "Stable runtime healthy"
     });
-    db.recordDeployment({
-      projectId: config.projectId,
-      target: "preview",
-      status: "healthy",
-      url: "http://127.0.0.1:3100",
-      commit: "candidate_sha",
-      reason: "Preview runtime healthy"
-    });
-
     const latestTaskEvent = db.getLatestTaskEvent("task_branchy");
     const deployments = db.getDeploymentSnapshot(config.projectId);
 
     assert.equal(latestTaskEvent?.type, "completed");
     assert.equal(latestTaskEvent?.payload?.status, "completed");
     assert.equal(deployments.stable.branch, "main");
-    assert.equal(deployments.preview.branch, "candidate");
     assert.equal(deployments.stable.activeSlot, "stable-b");
   });
 });

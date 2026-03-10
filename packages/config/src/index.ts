@@ -78,7 +78,6 @@ export async function detectPackageManagerAndScripts(repoRoot: string): Promise<
       build: scripts.build ? pmRun("build") : "echo 'build script not configured'",
       smoke: scripts.smoke ? pmRun("smoke") : scripts.test ? pmRun("test") : "echo 'smoke script not configured'",
       serveStable: chooseServeScript(packageManager, scripts, ["start", "serve", "preview"]),
-      servePreview: chooseServeScript(packageManager, scripts, ["preview", "dev", "start"]),
       serveWorker: chooseServeScript(packageManager, scripts, ["dev", "preview", "start"]),
       e2e: chooseServeScript(packageManager, scripts, ["e2e", "test:e2e", "playwright"]),
       healthcheck:
@@ -201,7 +200,6 @@ export function buildFactoryConfig(
       stableProxy: 3000,
       stableA: 3001,
       stableB: 3002,
-      preview: 3100,
       dashboard: 8787,
       appServer: 7781,
       workerStart: 3200,

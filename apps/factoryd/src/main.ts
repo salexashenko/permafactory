@@ -42,16 +42,20 @@ import {
   applyWorkerSandboxCapabilities,
   buildProjectSpecExcerpt,
   currentCommit,
+  compressRecentManagerTurns,
+  computeNoActiveWorkWakeCooldownMs,
   deriveEffectivePortLeaseRequirement,
   ensureDetachedWorktreeAtRef,
   ensureDir,
   fileExists,
   getFactoryPaths,
+  isManagerTurnNoOp,
   isPlaceholderScript,
   isLikelyGreenfieldRepoFiles,
   listDirtyFiles,
   loadEnvFile,
   localDateString,
+  normalizeManagerLoopSummary,
   normalizeManagerTurnOutput,
   nowIso,
   pollTelegramUpdates,
@@ -85,7 +89,7 @@ type JsonRpcResponse = {
   params?: unknown;
 };
 
-type RuntimeSlotName = "stable-a" | "stable-b" | "preview";
+type RuntimeSlotName = "stable-a" | "stable-b";
 
 const MANAGER_TOOL_NAMES: ReadonlySet<ManagerToolName> = new Set([
   "get_factory_status",
@@ -135,7 +139,7 @@ interface ResolvedRuntimeScripts {
 }
 
 interface RuntimeDeployIdentity {
-  target: "stable" | "preview";
+  target: "stable";
   slot: RuntimeSlotName;
   commit: string;
   branch?: string;
@@ -842,14 +846,10 @@ class FactorySupervisor {
     }
     this.workerChildren.clear();
 
-    for (const slot of ["stable-a", "stable-b", "preview"] as RuntimeSlotName[]) {
+    for (const slot of ["stable-a", "stable-b"] as RuntimeSlotName[]) {
       await this.stopRuntimeProcess(slot);
     }
-    for (const port of [
-      this.config.ports.stableA,
-      this.config.ports.stableB,
-      this.config.ports.preview
-    ]) {
+    for (const port of [this.config.ports.stableA, this.config.ports.stableB]) {
       await this.stopOrphanRuntimeListeners(port);
     }
 
@@ -1014,8 +1014,16 @@ class FactorySupervisor {
       return;
     }
 
-    const cooldownMs = Math.max(this.config.scheduler.tickSeconds * 1000, 60_000);
+    const recentTurns = this.db.listRecentManagerTurns(this.config.projectId, 12);
+    const cooldownMs = computeNoActiveWorkWakeCooldownMs(
+      recentTurns,
+      Math.max(this.config.scheduler.tickSeconds * 1000, 60_000)
+    );
+    const lastNoActiveTurnAtMs = Date.parse(recentTurns[0]?.at ?? "");
     if (Date.now() - this.lastNoActiveWorkWakeAt < cooldownMs) {
+      return;
+    }
+    if (Number.isFinite(lastNoActiveTurnAtMs) && Date.now() - lastNoActiveTurnAtMs < cooldownMs) {
       return;
     }
 
@@ -1218,38 +1226,16 @@ class FactorySupervisor {
     }
 
     const normalizedSummaries = new Set(
-      recentTurns.slice(0, 3).map((turn) => this.normalizeManagerLoopSummary(turn.summary))
+      recentTurns.slice(0, 3).map((turn) => normalizeManagerLoopSummary(turn.summary))
     );
     const repeatedNoOpLoop =
-      recentTurns.slice(0, 3).every((turn) => this.isNoOpManagerTurn(turn)) &&
+      recentTurns.slice(0, 3).every((turn) => isManagerTurnNoOp(turn)) &&
       normalizedSummaries.size === 1;
     const repeatedMismatchLoop = recentTurns
       .slice(0, 3)
       .every((turn) => turn.toolCalls.length === 0 && turn.mismatchHints.length > 0);
 
     return repeatedNoOpLoop || repeatedMismatchLoop;
-  }
-
-  private isNoOpManagerTurn(turn: ManagerTurnInput["recentManagerTurns"][number]): boolean {
-    const totalActions =
-      turn.actionCounts.tasksToStart +
-      turn.actionCounts.tasksToCancel +
-      turn.actionCounts.reviewsToStart +
-      turn.actionCounts.integrations +
-      turn.actionCounts.deployments +
-      turn.actionCounts.decisions +
-      turn.actionCounts.userMessages;
-    return totalActions === 0 && turn.toolCalls.length === 0;
-  }
-
-  private normalizeManagerLoopSummary(summary: string): string {
-    return summary
-      .replace(/`[^`]+`/g, "`ref`")
-      .replace(/\b[0-9a-f]{8,40}\b/gi, "sha")
-      .replace(/\d+/g, "n")
-      .replace(/\s+/g, " ")
-      .trim()
-      .toLowerCase();
   }
 
   private async buildManagerInstructions(): Promise<string> {
@@ -1341,6 +1327,7 @@ class FactorySupervisor {
     input.repo.appearsGreenfield = isLikelyGreenfieldRepoFiles(trackedFiles, this.config.projectSpecPath);
     await this.enrichManagerTaskFacts(input);
     await this.enrichManagerBranchFacts(input);
+    input.recentManagerTurns = compressRecentManagerTurns(input.recentManagerTurns, { maxTurns: 8 });
     input.resources = resources;
     input.deployments = this.db.getDeploymentSnapshot(this.config.projectId);
     return input;
@@ -1765,7 +1752,7 @@ class FactorySupervisor {
       return undefined;
     }
     const slot = relative.split(path.sep, 1)[0];
-    return slot === "stable-a" || slot === "stable-b" || slot === "preview" ? slot : undefined;
+    return slot === "stable-a" || slot === "stable-b" ? slot : undefined;
   }
 
   private async listSystemProcesses(): Promise<ProcessSnapshot[]> {
@@ -2090,7 +2077,7 @@ class FactorySupervisor {
   private buildManagerActionPreviewFromToolCalls(
     toolCalls: ManagerToolCallRecord[]
   ): ManagerTurnInput["recentManagerTurns"][number]["actionPreview"] {
-    const preview: ManagerTurnInput["recentManagerTurns"][number]["actionPreview"] = {
+    const actionPreview: ManagerTurnInput["recentManagerTurns"][number]["actionPreview"] = {
       tasksToStart: [],
       tasksToCancel: [],
       reviewsToStart: [],
@@ -2116,29 +2103,29 @@ class FactorySupervisor {
           break;
         case "start_task":
           if (typeof args.id === "string" && typeof args.branchName === "string") {
-            preview.tasksToStart.push(`${args.id}:${args.branchName}`);
+            actionPreview.tasksToStart.push(`${args.id}:${args.branchName}`);
           }
           break;
         case "cancel_task":
           if (typeof args.taskId === "string") {
-            preview.tasksToCancel.push(args.taskId);
+            actionPreview.tasksToCancel.push(args.taskId);
           }
           break;
         case "start_review":
           if (typeof args.branch === "string" && typeof args.baseBranch === "string") {
-            preview.reviewsToStart.push(`${args.branch}->${args.baseBranch}`);
+            actionPreview.reviewsToStart.push(`${args.branch}->${args.baseBranch}`);
           }
           break;
         case "integrate_branch":
           if (typeof args.branch === "string") {
-            preview.integrations.push(`${args.branch}->${typeof args.targetBranch === "string" ? args.targetBranch : "default"}`);
+            actionPreview.integrations.push(`${args.branch}->${typeof args.targetBranch === "string" ? args.targetBranch : "default"}`);
           } else if (typeof args.taskId === "string") {
-            preview.integrations.push(`${args.taskId}->${typeof args.targetBranch === "string" ? args.targetBranch : "default"}`);
+            actionPreview.integrations.push(`${args.taskId}->${typeof args.targetBranch === "string" ? args.targetBranch : "default"}`);
           }
           break;
         case "apply_deployment":
           if (typeof args.kind === "string") {
-            preview.deployments.push(args.kind);
+            actionPreview.deployments.push(args.kind);
           }
           break;
         case "request_decision":
@@ -2147,7 +2134,7 @@ class FactorySupervisor {
             typeof args.id === "string" &&
             typeof args.title === "string"
           ) {
-            preview.decisions.push(`${args.id}:${args.title}`);
+            actionPreview.decisions.push(`${args.id}:${args.title}`);
           }
           break;
         case "reply_user":
@@ -2156,13 +2143,13 @@ class FactorySupervisor {
             typeof args.kind === "string" &&
             typeof args.text === "string"
           ) {
-            preview.userMessages.push(`${args.kind}:${args.text.slice(0, 80)}`);
+            actionPreview.userMessages.push(`${args.kind}:${args.text.slice(0, 80)}`);
           }
           break;
       }
     }
 
-    return preview;
+    return actionPreview;
   }
 
   private buildManagerActionCounts(
@@ -2277,7 +2264,7 @@ class FactorySupervisor {
       hints.push("summary_mentions_integration_without_integration_action");
     }
     if (
-      /(deploy|rollback|promot|ship|preview update)/i.test(summary) &&
+      /(deploy|rollback|promot|ship)/i.test(summary) &&
       actionPreview.deployments.length === 0
     ) {
       hints.push("summary_mentions_deployment_without_deployment_action");
@@ -2357,7 +2344,11 @@ class FactorySupervisor {
       case "get_factory_status": {
         const resources = await this.sampleManagerResources();
         const snapshot = await this.buildManagerInput(resources);
-        return { snapshot: JSON.parse(JSON.stringify(snapshot)) as Record<string, unknown> };
+        return {
+          source: "factoryd",
+          generatedAt: nowIso(),
+          snapshot: JSON.parse(JSON.stringify(snapshot)) as Record<string, unknown>
+        };
       }
       case "inspect_branch_diff": {
         return await this.inspectBranchDiff(args);
@@ -2454,15 +2445,6 @@ class FactorySupervisor {
         const deployment = args as unknown as DeploymentIntent;
         await this.handleDeploymentIntent(deployment);
         const snapshot = this.db.getDeploymentSnapshot(this.config.projectId);
-        if (deployment.kind === "deploy_preview") {
-          return {
-            kind: deployment.kind,
-            target: "preview",
-            status: snapshot.preview.status,
-            url: snapshot.preview.url,
-            commit: snapshot.preview.commit
-          };
-        }
         return {
           kind: deployment.kind,
           target: "stable",
@@ -2621,35 +2603,18 @@ class FactorySupervisor {
   }
 
   private async inspectDeployState(args: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const target =
-      typeof args.target === "string" && ["stable", "preview", "all"].includes(args.target)
-        ? (args.target as "stable" | "preview" | "all")
-        : "all";
     const includeLogTailLines =
       typeof args.includeLogTailLines === "number" ? Math.max(0, Math.min(200, args.includeLogTailLines)) : 40;
     const snapshot = this.db.getDeploymentSnapshot(this.config.projectId);
+    const activeSlot = snapshot.stable.activeSlot;
+    const inactiveSlot: RuntimeSlotName = activeSlot === "stable-a" ? "stable-b" : "stable-a";
 
     return {
-      requestedTarget: target,
-      deployments:
-        target === "stable"
-          ? { stable: snapshot.stable }
-          : target === "preview"
-            ? { preview: snapshot.preview }
-            : snapshot,
-      runtimeProcesses:
-        target === "stable"
-          ? {
-              stable: await this.inspectRuntimeSlotState(snapshot.stable.activeSlot, includeLogTailLines)
-            }
-          : target === "preview"
-            ? {
-                preview: await this.inspectRuntimeSlotState("preview", includeLogTailLines)
-              }
-            : {
-                stable: await this.inspectRuntimeSlotState(snapshot.stable.activeSlot, includeLogTailLines),
-                preview: await this.inspectRuntimeSlotState("preview", includeLogTailLines)
-              }
+      deployments: snapshot,
+      runtimeProcesses: {
+        activeStable: await this.inspectRuntimeSlotState(activeSlot, includeLogTailLines),
+        inactiveStable: await this.inspectRuntimeSlotState(inactiveSlot, includeLogTailLines)
+      }
     };
   }
 
@@ -2749,6 +2714,21 @@ class FactorySupervisor {
     if (!shouldDeliverTelegramNotification(kind, options)) {
       console.log(`[telegram:suppressed:${kind}] ${text}`);
       return false;
+    }
+
+    if (kind === "incident_alert") {
+      const latestIncident = this.db.getLatestTelegramMessageByKind(this.config.projectId, "incident_alert");
+      const latestIncidentAtMs = Date.parse(latestIncident?.recordedAt ?? "");
+      const dedupeWindowMs = 6 * 60 * 60_000;
+      if (
+        latestIncident &&
+        latestIncident.text.trim() === text.trim() &&
+        Number.isFinite(latestIncidentAtMs) &&
+        Date.now() - latestIncidentAtMs < dedupeWindowMs
+      ) {
+        console.log(`[telegram:suppressed:${kind}:duplicate] ${text}`);
+        return false;
+      }
     }
 
     const messageId = randomId("telegram");
@@ -3016,7 +2996,7 @@ class FactorySupervisor {
       baseBranch: review.baseBranch || task.baseBranch || task.contract.baseBranch,
       branchName: review.branch || task.branchName || task.contract.branchName,
       worktreePath: review.worktreePath || task.worktreePath || task.contract.worktreePath,
-      needsPreview: false,
+      needsAppRuntime: false,
       ports: {},
       runtime: { maxRuntimeMinutes: 60, reasoningEffort: "medium" },
       constraints: {
@@ -3565,12 +3545,6 @@ class FactorySupervisor {
   private async handleDeploymentIntent(
     intent: DeploymentIntent
   ): Promise<void> {
-    if (intent.kind === "deploy_preview") {
-      const commit = intent.commit ?? (await currentCommit(this.config.repoRoot, this.config.candidateBranch));
-      await this.deployPreview(commit, intent.reason);
-      return;
-    }
-
     if (intent.kind === "promote_candidate") {
       const commit = intent.commit ?? (await currentCommit(this.config.repoRoot, this.config.candidateBranch));
       await this.promoteCandidate(commit, intent.reason);
@@ -3590,7 +3564,6 @@ class FactorySupervisor {
   private async reconcileRuntimeTargets(appearsGreenfield: boolean): Promise<void> {
     const snapshot = this.db.getDeploymentSnapshot(this.config.projectId);
     const stableUrl = await this.resolveStableUrl();
-    const previewUrl = await this.resolvePreviewUrl();
     if (appearsGreenfield) {
       if (snapshot.stable.status !== "down" || snapshot.stable.reason !== "stable runtime deferred until repo has runnable app files") {
         this.db.recordDeployment({
@@ -3601,16 +3574,6 @@ class FactorySupervisor {
           commit: snapshot.stable.commit,
           activeSlot: snapshot.stable.activeSlot,
           reason: "stable runtime deferred until repo has runnable app files"
-        });
-      }
-      if (snapshot.preview.status !== "down" || snapshot.preview.reason !== "preview runtime deferred until repo has runnable app files") {
-        this.db.recordDeployment({
-          projectId: this.config.projectId,
-          target: "preview",
-          status: "down",
-          url: previewUrl,
-          commit: snapshot.preview.commit,
-          reason: "preview runtime deferred until repo has runnable app files"
         });
       }
       return;
@@ -3650,38 +3613,6 @@ class FactorySupervisor {
     } else {
       await this.bootstrapStableRuntime();
     }
-
-    if (snapshot.preview.commit) {
-      const ensured = await this.ensureRuntimeProcess(
-        "preview",
-        snapshot.preview.commit,
-        this.config.ports.preview
-      );
-      if (ensured.ok) {
-        if (snapshot.preview.status !== "healthy") {
-          this.db.recordDeployment({
-            projectId: this.config.projectId,
-            target: "preview",
-            status: "healthy",
-            url: previewUrl,
-            commit: snapshot.preview.commit,
-            reason: "preview runtime healthy"
-          });
-        }
-      } else {
-        this.db.recordDeployment({
-          projectId: this.config.projectId,
-          target: "preview",
-          status: "down",
-          url: previewUrl,
-          commit: snapshot.preview.commit,
-          reason:
-            ensured.reason === "serve_script_not_configured"
-              ? "preview serve script not configured"
-              : "preview slot failed healthcheck"
-        });
-      }
-    }
   }
 
   private async bootstrapStableRuntime(): Promise<void> {
@@ -3706,28 +3637,6 @@ class FactorySupervisor {
             ? "stable serve script not configured"
             : "bootstrap stable runtime failed"
     });
-  }
-
-  private async deployPreview(commit: string, reason: string): Promise<void> {
-    const ensured = await this.ensureRuntimeProcess("preview", commit, this.config.ports.preview);
-    if (!ensured.ok && ensured.reason === "serve_script_not_configured") {
-      throw new Error("Preview serve script is not configured");
-    }
-    const previewUrl = await this.resolvePreviewUrl();
-    this.db.recordDeployment({
-      projectId: this.config.projectId,
-      target: "preview",
-      status: ensured.ok ? "healthy" : "down",
-      url: previewUrl,
-      commit,
-      reason
-    });
-    await this.sendTelegramMessage(
-      ensured.ok ? "info_update" : "incident_alert",
-      ensured.ok
-        ? `Preview updated: ${previewUrl}\nCommit: ${commit.slice(0, 12)}\n${reason}`
-        : `Preview deployment failed for ${commit.slice(0, 12)}.\nExpected URL: ${previewUrl}\n${reason}`
-    );
   }
 
   private async promoteCandidate(commit: string, reason: string): Promise<void> {
@@ -3960,14 +3869,7 @@ class FactorySupervisor {
     if (slot === "stable-a") {
       return this.config.ports.stableA;
     }
-    if (slot === "stable-b") {
-      return this.config.ports.stableB;
-    }
-    return this.config.ports.preview;
-  }
-
-  private configuredServeScriptForSlot(slot: RuntimeSlotName): string {
-    return slot === "preview" ? this.config.scripts.servePreview : this.config.scripts.serveStable;
+    return this.config.ports.stableB;
   }
 
   private async safeConfiguredScriptForWorktree(
@@ -3989,8 +3891,6 @@ class FactorySupervisor {
     worktreePath: string
   ): Promise<ResolvedRuntimeScripts> {
     const detected = await detectPackageManagerAndScripts(worktreePath);
-    const detectedServeScript =
-      slot === "preview" ? detected.scripts.servePreview : detected.scripts.serveStable;
     const configuredBuildScript = await this.safeConfiguredScriptForWorktree(
       worktreePath,
       this.config.scripts.build,
@@ -3998,7 +3898,7 @@ class FactorySupervisor {
     );
     const configuredServeScript = await this.safeConfiguredScriptForWorktree(
       worktreePath,
-      this.configuredServeScriptForSlot(slot),
+      this.config.scripts.serveStable,
       "serve"
     );
     const configuredHealthcheckScript = await this.safeConfiguredScriptForWorktree(
@@ -4009,10 +3909,7 @@ class FactorySupervisor {
     return {
       worktreePath,
       buildScript: resolveRuntimeScriptCommand(detected.scripts.build, configuredBuildScript),
-      serveScript: resolveRuntimeScriptCommand(
-        detectedServeScript,
-        configuredServeScript
-      ),
+      serveScript: resolveRuntimeScriptCommand(detected.scripts.serveStable, configuredServeScript),
       healthcheckScript: resolveRuntimeScriptCommand(
         detected.scripts.healthcheck,
         configuredHealthcheckScript
@@ -4071,24 +3968,20 @@ class FactorySupervisor {
     commit: string,
     port: number
   ): Promise<RuntimeDeployIdentity> {
-    const target = slot === "preview" ? "preview" : "stable";
-    const branch = await this.resolveDeployedBranch(target, commit);
+    const branch = await this.resolveDeployedBranch(commit);
     return {
-      target,
+      target: "stable",
       slot,
       commit,
       branch,
       port,
-      url: await resolveReachableHttpUrl(target === "preview" ? this.config.ports.preview : this.config.ports.stableProxy),
+      url: await resolveReachableHttpUrl(this.config.ports.stableProxy),
       generatedAt: nowIso()
     };
   }
 
-  private async resolveDeployedBranch(
-    target: "stable" | "preview",
-    commit: string
-  ): Promise<string | undefined> {
-    const preferredBranch = target === "preview" ? this.config.candidateBranch : this.config.defaultBranch;
+  private async resolveDeployedBranch(commit: string): Promise<string | undefined> {
+    const preferredBranch = this.config.defaultBranch;
     const preferredHead = await currentCommit(this.config.repoRoot, preferredBranch).catch(() => undefined);
     if (preferredHead === commit) {
       return preferredBranch;
@@ -4275,10 +4168,6 @@ class FactorySupervisor {
     return await resolveReachableHttpUrl(this.config.ports.stableProxy);
   }
 
-  private async resolvePreviewUrl(): Promise<string> {
-    return await resolveReachableHttpUrl(this.config.ports.preview);
-  }
-
   private async proxyStableHttp(
     request: http.IncomingMessage,
     response: http.ServerResponse
@@ -4407,7 +4296,6 @@ class FactorySupervisor {
       `Open decisions: ${openDecisions.length}\n` +
       `Agents running: ${agents.filter((agent) => agent.status === "running").length}\n` +
       `Stable: ${deployments.stable.status} ${deployments.stable.commit.slice(0, 12) || "none"}\n` +
-      `Preview: ${deployments.preview.status} ${deployments.preview.commit.slice(0, 12) || "none"}\n` +
       `Free worker slots: ${resources.freeWorkerSlots}`;
     await this.sendTelegramMessage("daily_digest", text);
   }
@@ -5033,7 +4921,7 @@ class FactorySupervisor {
     });
     await this.sendTelegramMessage(
       "info_update",
-      "Stopping the factory now. Active workers, preview, and stable runtimes are being shut down cleanly.",
+      "Stopping the factory now. Active workers and stable runtimes are being shut down cleanly.",
       replyToMessageId,
       undefined,
       undefined,

@@ -27,7 +27,7 @@ const taskContractSchema = z.object({
   branchName: z.string().min(1),
   worktreePath: z.string().min(1),
   lockScope: z.array(z.string()),
-  needsPreview: z.boolean(),
+  needsAppRuntime: z.boolean(),
   ports: z
     .object({
       app: z.number().int().optional(),
@@ -89,7 +89,7 @@ const integrationRequestSchema = z
 
 const deploymentIntentSchema = z
   .object({
-    kind: z.enum(["deploy_preview", "promote_candidate", "rollback_stable"]),
+    kind: z.enum(["promote_candidate", "rollback_stable"]),
     reason: z.string().min(1),
     commit: z.string().optional(),
     rollbackTag: z.string().optional()
@@ -121,7 +121,7 @@ const decisionRequestSchema = z
 
 const replyUserSchema = z
   .object({
-    kind: z.enum(["info_update", "daily_digest"]),
+    kind: z.enum(["info_update", "incident_alert", "daily_digest"]),
     text: z.string().min(1),
     replyToMessageId: z.string().optional(),
     decisionId: z.string().optional()
@@ -150,7 +150,6 @@ const readTaskArtifactsSchema = z
 
 const inspectDeployStateSchema = z
   .object({
-    target: z.enum(["stable", "preview", "all"]).optional(),
     includeLogTailLines: z.number().int().min(0).max(200).optional()
   })
   .strict();
@@ -255,7 +254,7 @@ async function main(): Promise<void> {
     "inspect_deploy_state",
     {
       description:
-        "Inspect stable/preview deployment identity, branches, runtime slot state, and recent runtime logs.",
+        "Inspect stable deployment identity, active/inactive stable slot state, and recent runtime logs.",
       inputSchema: inspectDeployStateSchema
     },
     async (args, extra) => await runTool("inspect_deploy_state", extra, args)
@@ -320,7 +319,7 @@ async function main(): Promise<void> {
   server.registerTool(
     "apply_deployment",
     {
-      description: "Deploy preview, promote candidate to stable, or roll stable back.",
+      description: "Promote candidate to stable or roll stable back.",
       inputSchema: deploymentIntentSchema
     },
     async (args, extra) => await runTool("apply_deployment", extra, args)

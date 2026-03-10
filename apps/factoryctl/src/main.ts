@@ -694,7 +694,6 @@ async function handleStop(args: string[]): Promise<void> {
     config.ports.stableProxy,
     config.ports.stableA,
     config.ports.stableB,
-    config.ports.preview,
     config.ports.dashboard,
     config.ports.appServer
   ];

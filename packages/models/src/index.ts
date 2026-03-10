@@ -111,7 +111,6 @@ export interface FactoryProjectConfig {
     stableProxy: number;
     stableA: number;
     stableB: number;
-    preview: number;
     dashboard: number;
     appServer: number;
     workerStart: number;
@@ -127,7 +126,6 @@ export interface FactoryProjectConfig {
     build: string;
     smoke: string;
     serveStable: string;
-    servePreview: string;
     serveWorker: string;
     e2e: string;
     healthcheck: string;
@@ -256,14 +254,6 @@ export interface ManagerTurnInput {
       canRollback?: boolean;
       rollbackTargetCommit?: string;
     };
-    preview: {
-      status: DeploymentStatus;
-      url: string;
-      commit: string;
-      branch?: string;
-      reason?: string;
-      updatedAt?: string;
-    };
   };
   resources: {
     cpuPercent: number;
@@ -331,7 +321,7 @@ export interface IntegrationRequest {
 }
 
 export interface DeploymentIntent {
-  kind: "deploy_preview" | "promote_candidate" | "rollback_stable";
+  kind: "promote_candidate" | "rollback_stable";
   reason: string;
   commit?: string;
   rollbackTag?: string;
@@ -367,7 +357,7 @@ export interface TaskContract {
   branchName: string;
   worktreePath: string;
   lockScope: string[];
-  needsPreview: boolean;
+  needsAppRuntime: boolean;
   ports: {
     app?: number;
     e2e?: number;
