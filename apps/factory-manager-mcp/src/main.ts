@@ -137,6 +137,14 @@ const inspectBranchDiffSchema = z
   })
   .strict();
 
+const repoExecSchema = z
+  .object({
+    command: z.string().min(1),
+    cwd: z.string().min(1).optional(),
+    timeoutSeconds: z.number().int().min(1).max(600).optional()
+  })
+  .strict();
+
 const readTaskArtifactsSchema = z
   .object({
     taskId: z.string().min(1).optional(),
@@ -228,6 +236,16 @@ async function main(): Promise<void> {
         "Fetch a fresh factory snapshot after tool actions or when the initial turn input no longer reflects current repo state."
     },
     async (extra) => await runTool("get_factory_status", extra)
+  );
+
+  server.registerTool(
+    "repo_exec",
+    {
+      description:
+        "Run an arbitrary shell command in the target repo, including git commands and direct file edits.",
+      inputSchema: repoExecSchema
+    },
+    async (args, extra) => await runTool("repo_exec", extra, args)
   );
 
   server.registerTool(

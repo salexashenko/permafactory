@@ -46,6 +46,7 @@ export type WorkerResultStatus = "completed" | "blocked" | "failed";
 export type CheckStatus = "passed" | "failed" | "not_run";
 export type ManagerToolName =
   | "get_factory_status"
+  | "repo_exec"
   | "inspect_branch_diff"
   | "read_task_artifacts"
   | "inspect_deploy_state"

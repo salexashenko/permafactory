@@ -290,13 +290,15 @@ export async function runCommand(
     cwd?: string;
     env?: NodeJS.ProcessEnv;
     allowNonZeroExit?: boolean;
+    timeoutMs?: number;
   } = {}
 ): Promise<CommandResult> {
   try {
     const { stdout, stderr } = await execFileAsync(command, args, {
       cwd: options.cwd,
       env: { ...process.env, ...options.env },
-      maxBuffer: 32 * 1024 * 1024
+      maxBuffer: 32 * 1024 * 1024,
+      timeout: options.timeoutMs
     });
     return { stdout, stderr, exitCode: 0 };
   } catch (error) {
@@ -326,6 +328,7 @@ export async function runShellCommand(
     cwd?: string;
     env?: NodeJS.ProcessEnv;
     allowNonZeroExit?: boolean;
+    timeoutMs?: number;
   } = {}
 ): Promise<CommandResult> {
   return await runCommand("bash", ["-lc", script], options);

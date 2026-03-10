@@ -65,6 +65,7 @@ import {
   resolveRuntimeScriptCommand,
   resolveReachableHttpUrl,
   runCommand,
+  runShellCommand,
   sampleResources,
   selectTaskCommitMessage,
   selectTaskWorktreePath,
@@ -93,6 +94,7 @@ type RuntimeSlotName = "stable-a" | "stable-b";
 
 const MANAGER_TOOL_NAMES: ReadonlySet<ManagerToolName> = new Set([
   "get_factory_status",
+  "repo_exec",
   "inspect_branch_diff",
   "read_task_artifacts",
   "inspect_deploy_state",
@@ -2094,6 +2096,7 @@ class FactorySupervisor {
 
       const args = call.args ?? {};
       switch (call.toolName) {
+        case "repo_exec":
         case "inspect_branch_diff":
         case "read_task_artifacts":
         case "inspect_deploy_state":
@@ -2174,6 +2177,13 @@ class FactorySupervisor {
     const args = call.args ?? {};
     let subject = "";
     switch (call.toolName) {
+      case "repo_exec":
+        if (typeof args.cwd === "string" && args.cwd.length > 0) {
+          subject = `:${args.cwd}`;
+        } else {
+          subject = ":.";
+        }
+        break;
       case "inspect_branch_diff":
         if (typeof args.branch === "string") {
           subject = `:${args.branch}->${typeof args.baseBranch === "string" ? args.baseBranch : "default"}`;
@@ -2350,6 +2360,9 @@ class FactorySupervisor {
           snapshot: JSON.parse(JSON.stringify(snapshot)) as Record<string, unknown>
         };
       }
+      case "repo_exec": {
+        return await this.runManagerRepoExec(args);
+      }
       case "inspect_branch_diff": {
         return await this.inspectBranchDiff(args);
       }
@@ -2483,6 +2496,43 @@ class FactorySupervisor {
     }
 
     throw new Error(`Unknown manager tool: ${String(toolName)}`);
+  }
+
+  private async runManagerRepoExec(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const command = this.requireStringArg(args, "command");
+    const requestedCwd =
+      typeof args.cwd === "string" && args.cwd.trim().length > 0 ? args.cwd.trim() : this.config.repoRoot;
+    const cwd = path.isAbsolute(requestedCwd) ? requestedCwd : path.resolve(this.config.repoRoot, requestedCwd);
+    const timeoutSeconds =
+      typeof args.timeoutSeconds === "number"
+        ? Math.max(1, Math.min(600, Math.trunc(args.timeoutSeconds)))
+        : 120;
+    const result = await runShellCommand(command, {
+      cwd,
+      allowNonZeroExit: true,
+      timeoutMs: timeoutSeconds * 1000,
+      env: {
+        PERMAFACTORY_REPO_ROOT: this.config.repoRoot,
+        PERMAFACTORY_DEFAULT_BRANCH: this.config.defaultBranch,
+        PERMAFACTORY_CANDIDATE_BRANCH: this.config.candidateBranch
+      }
+    });
+    return {
+      command,
+      cwd,
+      timeoutSeconds,
+      exitCode: result.exitCode,
+      stdout: this.truncateManagerRepoExecOutput(result.stdout),
+      stderr: this.truncateManagerRepoExecOutput(result.stderr)
+    };
+  }
+
+  private truncateManagerRepoExecOutput(output: string): string {
+    const limit = 40_000;
+    if (output.length <= limit) {
+      return output;
+    }
+    return `${output.slice(0, limit)}\n...[truncated ${output.length - limit} chars]`;
   }
 
   private async inspectBranchDiff(args: Record<string, unknown>): Promise<Record<string, unknown>> {
